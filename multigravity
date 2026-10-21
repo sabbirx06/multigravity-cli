@@ -126,6 +126,50 @@ command_or_path() {
   return 1
 }
 
+find_ide() {
+  local override candidate
+
+  override="${MULTIGRAVITY_IDE-}"
+  if [ -n "$override" ] && command_or_path "$override" >/dev/null 2>&1; then
+    command_or_path "$override"
+    return 0
+  fi
+
+  case "$(platform)" in
+    darwin)
+      for candidate in \
+        "/Applications/Antigravity IDE.app" \
+        "$HOME/Applications/Antigravity IDE.app" \
+        "/Applications/Antigravity.app" \
+        "$HOME/Applications/Antigravity.app"
+      do
+        if [ -d "$candidate" ]; then
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+      done
+      ;;
+    linux)
+      for candidate in \
+        "antigravity-ide" \
+        "/usr/share/antigravity-ide/antigravity-ide" \
+        "/usr/bin/antigravity-ide" \
+        "/usr/local/bin/antigravity-ide" \
+        "$HOME/.local/bin/antigravity-ide" \
+        "antigravity" \
+        "/usr/bin/antigravity"
+      do
+        if command_or_path "$candidate" >/dev/null 2>&1; then
+          command_or_path "$candidate"
+          return 0
+        fi
+      done
+      ;;
+  esac
+
+  return 1
+}
+
 find_app() {
   local override candidate
 
@@ -167,6 +211,51 @@ find_app() {
   return 1
 }
 
+find_agy() {
+  local override candidate
+
+  override="${MULTIGRAVITY_AGY-}"
+  if [ -n "$override" ] && command_or_path "$override" >/dev/null 2>&1; then
+    command_or_path "$override"
+    return 0
+  fi
+
+  for candidate in \
+    "agy" \
+    "$HOME/.local/bin/agy" \
+    "/usr/local/bin/agy" \
+    "/usr/bin/agy"
+  do
+    if command_or_path "$candidate" >/dev/null 2>&1; then
+      command_or_path "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+require_ide() {
+  local app
+
+  if ! app="$(find_ide)"; then
+    if app="$(find_app)"; then
+      printf '%s\n' "$app"
+      return 0
+    fi
+    case "$(platform)" in
+      darwin)
+        abort "Antigravity IDE was not found. Install Antigravity IDE or set MULTIGRAVITY_IDE."
+        ;;
+      linux)
+        abort "Antigravity IDE was not found. Install it so 'antigravity-ide' is on PATH, or set MULTIGRAVITY_IDE."
+        ;;
+    esac
+  fi
+
+  printf '%s\n' "$app"
+}
+
 require_app() {
   local app
 
@@ -182,6 +271,16 @@ require_app() {
   fi
 
   printf '%s\n' "$app"
+}
+
+require_agy() {
+  local agy_bin
+
+  if ! agy_bin="$(find_agy)"; then
+    abort "agy CLI was not found. Ensure agy is on PATH or set MULTIGRAVITY_AGY."
+  fi
+
+  printf '%s\n' "$agy_bin"
 }
 
 create_profile_layout() {
@@ -416,7 +515,40 @@ remove_shortcut() {
   esac
 }
 
-launch_profile() {
+launch_agy() {
+  local profile=$1
+  shift || true
+
+  local profile_path
+  local agy_bin
+
+  profile_path="$(profile_dir "$profile")"
+  if [ ! -d "$profile_path" ]; then
+    abort "profile '$profile' does not exist. Run: multigravity new $profile"
+  fi
+
+  create_profile_layout "$profile_path"
+
+  agy_bin="$(require_agy)"
+
+  print_info "Launching agy CLI with profile '$profile'..."
+
+  case "$(platform)" in
+    darwin)
+      HOME="$profile_path" "$agy_bin" "$@"
+      ;;
+    linux)
+      HOME="$profile_path" \
+      XDG_CONFIG_HOME="$profile_path/.config" \
+      XDG_CACHE_HOME="$profile_path/.cache" \
+      XDG_DATA_HOME="$profile_path/.local/share" \
+      XDG_STATE_HOME="$profile_path/.local/state" \
+      "$agy_bin" "$@"
+      ;;
+  esac
+}
+
+launch_app() {
   local profile=$1
   shift || true
 
@@ -436,7 +568,7 @@ launch_profile() {
   data_dir="$(user_data_dir "$profile_path")"
   ext_dir="$(extensions_dir "$profile_path")"
 
-  print_info "Launching Antigravity profile '$profile'"
+  print_info "Launching Antigravity 2.0 app profile '$profile'"
 
   case "$(platform)" in
     darwin)
@@ -457,6 +589,76 @@ launch_profile() {
         "$@"
       ;;
   esac
+}
+
+launch_ide() {
+  local profile=$1
+  shift || true
+
+  local profile_path
+  local app
+  local data_dir
+  local ext_dir
+
+  profile_path="$(profile_dir "$profile")"
+  if [ ! -d "$profile_path" ]; then
+    abort "profile '$profile' does not exist. Run: multigravity new $profile"
+  fi
+
+  create_profile_layout "$profile_path"
+
+  app="$(require_ide)"
+  data_dir="$(user_data_dir "$profile_path")"
+  ext_dir="$(extensions_dir "$profile_path")"
+
+  print_info "Launching Antigravity IDE profile '$profile'"
+
+  case "$(platform)" in
+    darwin)
+      HOME="$profile_path" open -n "$app" --args \
+        --user-data-dir "$data_dir" \
+        --extensions-dir "$ext_dir" \
+        "$@"
+      ;;
+    linux)
+      HOME="$profile_path" \
+      XDG_CONFIG_HOME="$profile_path/.config" \
+      XDG_CACHE_HOME="$profile_path/.cache" \
+      XDG_DATA_HOME="$profile_path/.local/share" \
+      XDG_STATE_HOME="$profile_path/.local/state" \
+      "$app" \
+        --user-data-dir "$data_dir" \
+        --extensions-dir "$ext_dir" \
+        "$@"
+      ;;
+  esac
+}
+
+launch_profile() {
+  local profile=$1
+  shift || true
+
+  local is_app=false
+  local is_cli=false
+  local forwarded=()
+
+  for arg in "$@"; do
+    if [ "$arg" = "--app" ]; then
+      is_app=true
+    elif [ "$arg" = "--cli" ] || [ "$arg" = "--terminal" ] || [ "$arg" = "agy" ]; then
+      is_cli=true
+    else
+      forwarded+=("$arg")
+    fi
+  done
+
+  if [ "$is_cli" = true ]; then
+    launch_agy "$profile" "${forwarded[@]+"${forwarded[@]}"}"
+  elif [ "$is_app" = true ]; then
+    launch_app "$profile" "${forwarded[@]+"${forwarded[@]}"}"
+  else
+    launch_ide "$profile" "${forwarded[@]+"${forwarded[@]}"}"
+  fi
 }
 
 list_profiles() {
@@ -619,12 +821,28 @@ doctor_cli() {
     errors=$((errors + 1))
   fi
 
-  # 2. Antigravity Installation
-  if app=$(find_app); then
-    echo "  [✓] Antigravity: Found at $app"
+  # 2. Antigravity IDE Installation (Default)
+  if ide=$(find_ide); then
+    echo "  [✓] Antigravity IDE (default): Found at $ide"
   else
-    echo "  [✗] Antigravity: Not found. Ensure it is installed or set MULTIGRAVITY_APP."
-    errors=$((errors + 1))
+    echo "  [!] Antigravity IDE: Not found. Will fall back to Antigravity App if present."
+    warnings=$((warnings + 1))
+  fi
+
+  # 3. Antigravity 2.0 App Installation (--app)
+  if app=$(find_app); then
+    echo "  [✓] Antigravity 2.0 App (--app): Found at $app"
+  else
+    echo "  [!] Antigravity 2.0 App: Not found."
+    warnings=$((warnings + 1))
+  fi
+
+  # 4. agy CLI Installation (terminal)
+  if agy_bin=$(find_agy); then
+    echo "  [✓] agy CLI (terminal): Found at $agy_bin"
+  else
+    echo "  [!] agy CLI: Not found. Terminal mode will not be available."
+    warnings=$((warnings + 1))
   fi
 
   # 3. Path Check
@@ -990,13 +1208,18 @@ Commands:
   doctor                      Run a system diagnosis
   stats                       Show storage usage per profile
   completion                  Show setup instructions for shell completion
-  <name> [args...]            Launch Antigravity with the given profile
+  <name> [args...]            Launch Antigravity IDE (VS Code-like) with profile (Default)
+  <name> --app [args...]      Launch Antigravity 2.0 app with profile
+  agy <name> [args...]        Launch agy CLI in terminal with profile
+  <name> --cli [args...]      Launch agy CLI in terminal with profile
   help                        Show this help
 
 Profile names: alphanumeric and hyphens only (e.g. work, personal, test-1)
 
 Environment:
-  MULTIGRAVITY_APP      Override the Antigravity app path or command
+  MULTIGRAVITY_IDE      Override the Antigravity IDE app path or command
+  MULTIGRAVITY_APP      Override the Antigravity 2.0 app path or command
+  MULTIGRAVITY_AGY      Override the agy CLI executable path
   MULTIGRAVITY_HOME     Override the profile storage directory
 EOF
 }
@@ -1046,6 +1269,18 @@ case "$cmd" in
     else
       help_completion
     fi
+    ;;
+  agy)
+    [ -n "${2-}" ] || abort "profile name required for agy command. Usage: multigravity agy <profile> [args...]"
+    launch_agy "$2" "${@:3}"
+    ;;
+  app)
+    [ -n "${2-}" ] || abort "profile name required for app command. Usage: multigravity app <profile> [args...]"
+    launch_app "$2" "${@:3}"
+    ;;
+  ide)
+    [ -n "${2-}" ] || abort "profile name required for ide command. Usage: multigravity ide <profile> [args...]"
+    launch_ide "$2" "${@:3}"
     ;;
   help | --help | -h)
     usage

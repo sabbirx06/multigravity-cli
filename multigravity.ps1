@@ -19,7 +19,25 @@ param (
 
 $BASE = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\AntigravityProfiles" }
 
-function Find-Antigravity {
+function Find-AntigravityIde {
+    $paths = @(
+        "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe",
+        "$env:PROGRAMFILES\Antigravity IDE\Antigravity IDE.exe",
+        "${env:ProgramFiles(x86)}\Antigravity IDE\Antigravity IDE.exe"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) { return $p }
+    }
+    
+    $cmd = Get-Command antigravity-ide.cmd -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $cmd = Get-Command antigravity-ide -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    
+    return $null
+}
+
+function Find-AntigravityApp {
     $paths = @(
         "$env:LOCALAPPDATA\Programs\Antigravity\Antigravity.exe",
         "$env:PROGRAMFILES\Antigravity\Antigravity.exe",
@@ -36,7 +54,26 @@ function Find-Antigravity {
     return $null
 }
 
-$APP = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-Antigravity }
+function Find-Agy {
+    $cmd = Get-Command agy.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $cmd = Get-Command agy -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $paths = @(
+        "$env:LOCALAPPDATA\agy\bin\agy.EXE",
+        "$env:USERPROFILE\.local\bin\agy.EXE"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) { return $p }
+    }
+
+    return $null
+}
+
+$IDE_APP = if ($env:MULTIGRAVITY_IDE) { $env:MULTIGRAVITY_IDE } else { Find-AntigravityIde }
+$APP     = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-AntigravityApp }
+$AGY_APP = if ($env:MULTIGRAVITY_AGY) { $env:MULTIGRAVITY_AGY } else { Find-Agy }
 
 function Get-TemplatesDir {
     return "$BASE\.templates"
@@ -46,8 +83,16 @@ function Get-SystemDataDir {
     return "$env:APPDATA\Antigravity"
 }
 
+function Get-SystemIdeDataDir {
+    return "$env:APPDATA\Antigravity IDE"
+}
+
 function Get-SystemExtensionsDir {
     return "$env:USERPROFILE\.antigravity\extensions"
+}
+
+function Get-SystemIdeExtensionsDir {
+    return "$env:USERPROFILE\.antigravity-ide\extensions"
 }
 
 function Test-SharedProfile {
@@ -76,10 +121,19 @@ function Write-Usage {
     Write-Host "  doctor                      Run a system diagnosis"
     Write-Host "  stats                       Show storage usage per profile"
     Write-Host "  completion                  Show setup instructions for shell completion"
-    Write-Host "  <name>                      Launch Antigravity with the given profile"
+    Write-Host "  <name> [args]               Launch Antigravity IDE (VS Code-like) with profile (Default)"
+    Write-Host "  <name> --app [args]         Launch Antigravity 2.0 app with profile"
+    Write-Host "  agy <name> [args]           Launch agy CLI in terminal with profile"
+    Write-Host "  <name> --cli [args]         Launch agy CLI in terminal with profile"
     Write-Host "  help                        Show this help"
     Write-Host ""
     Write-Host "Profile names: alphanumeric and hyphens only (e.g. work, personal, test-1)"
+    Write-Host ""
+    Write-Host "Environment:"
+    Write-Host "  MULTIGRAVITY_IDE     Override the Antigravity IDE executable path"
+    Write-Host "  MULTIGRAVITY_APP     Override the Antigravity 2.0 app executable path"
+    Write-Host "  MULTIGRAVITY_AGY     Override the agy CLI executable path"
+    Write-Host "  MULTIGRAVITY_HOME    Override the profile storage directory"
 }
 
 function Validate-Name {
@@ -99,7 +153,10 @@ function Invoke-CreateProfile {
     $PROFILE_DIR = "$BASE\$PROFILE"
     
     New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.antigravity\extensions" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\AppData\Roaming" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.antigravity-ide\extensions" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.gemini\antigravity-cli" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\AppData\Roaming\Antigravity\User" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\AppData\Roaming\Antigravity IDE\User" | Out-Null
     New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\AppData\Local" | Out-Null
 }
 
@@ -107,17 +164,22 @@ function Invoke-CreateSharedProfile {
     param($name)
     $profileDir = "$BASE\$name"
     $sysData     = Get-SystemDataDir
+    $sysDataIde  = Get-SystemIdeDataDir
     $sysExt      = Get-SystemExtensionsDir
+    $sysExtIde   = Get-SystemIdeExtensionsDir
 
     New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
     New-Item -ItemType File      -Force -Path "$profileDir\.shared" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$profileDir\.gemini\antigravity-cli" | Out-Null
 
     # Isolated AppData so accounts don't bleed across profiles
-    $userDataDir = "$profileDir\AppData\Roaming\Antigravity\User"
+    $userDataDir    = "$profileDir\AppData\Roaming\Antigravity\User"
+    $userIdeDataDir = "$profileDir\AppData\Roaming\Antigravity IDE\User"
     New-Item -ItemType Directory -Force -Path $userDataDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $userIdeDataDir | Out-Null
     New-Item -ItemType Directory -Force -Path "$profileDir\AppData\Local" | Out-Null
 
-    # Symlink settings files from the system install so they stay in sync
+    # Symlink settings files for Antigravity App
     if (Test-Path "$sysData\User") {
         foreach ($f in @("settings.json", "keybindings.json", "snippets")) {
             $src  = "$sysData\User\$f"
@@ -128,7 +190,18 @@ function Invoke-CreateSharedProfile {
         }
     }
 
-    # Point extensions at the system folder instead of an empty private copy
+    # Symlink settings files for Antigravity IDE
+    if (Test-Path "$sysDataIde\User") {
+        foreach ($f in @("settings.json", "keybindings.json", "snippets")) {
+            $src  = "$sysDataIde\User\$f"
+            $dest = "$userIdeDataDir\$f"
+            if ((Test-Path $src) -and !(Test-Path $dest)) {
+                New-Item -ItemType SymbolicLink -Path $dest -Target $src -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+    }
+
+    # Point extensions at system folders
     $extDir = "$profileDir\.antigravity\extensions"
     if (Test-Path $sysExt) {
         if (Test-Path $extDir) { Remove-Item $extDir -Force -ErrorAction SilentlyContinue }
@@ -137,9 +210,18 @@ function Invoke-CreateSharedProfile {
     } else {
         New-Item -ItemType Directory -Force -Path $extDir | Out-Null
     }
+
+    $extDirIde = "$profileDir\.antigravity-ide\extensions"
+    if (Test-Path $sysExtIde) {
+        if (Test-Path $extDirIde) { Remove-Item $extDirIde -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Force -Path "$profileDir\.antigravity-ide" | Out-Null
+        New-Item -ItemType SymbolicLink -Path $extDirIde -Target $sysExtIde -ErrorAction SilentlyContinue | Out-Null
+    } else {
+        New-Item -ItemType Directory -Force -Path $extDirIde | Out-Null
+    }
 }
 
-function Invoke-LaunchProfile {
+function Invoke-LaunchIde {
     param($PROFILE, $ArgsToForward)
     $PROFILE_DIR = "$BASE\$PROFILE"
 
@@ -148,24 +230,102 @@ function Invoke-LaunchProfile {
         exit 1
     }
 
-    if ([string]::IsNullOrEmpty($APP) -or !(Test-Path $APP)) {
-        Write-Error "Error: Antigravity.exe not found"
+    $ideExec = if ($env:MULTIGRAVITY_IDE) { $env:MULTIGRAVITY_IDE } else { Find-AntigravityIde }
+    if ([string]::IsNullOrEmpty($ideExec) -or !(Test-Path $ideExec)) {
+        $ideExec = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-AntigravityApp }
+    }
+
+    if ([string]::IsNullOrEmpty($ideExec) -or !(Test-Path $ideExec)) {
+        Write-Error "Error: Antigravity IDE (Antigravity IDE.exe) not found. Ensure Antigravity IDE is installed or set MULTIGRAVITY_IDE."
         exit 1
     }
 
-    Write-Host "Launching Antigravity profile '$PROFILE'"
+    Write-Host "Launching Antigravity IDE profile '$PROFILE'"
     
-    # Launch Antigravity with isolated USERPROFILE
     $env:USERPROFILE = $PROFILE_DIR
     $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
     $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
     
-    if ($ArgsToForward) {
-        Start-Process -FilePath $APP -ArgumentList $ArgsToForward
+    if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
+        Start-Process -FilePath $ideExec -ArgumentList $ArgsToForward
     }
     else {
-        Start-Process -FilePath $APP
+        Start-Process -FilePath $ideExec
     }
+}
+
+function Invoke-LaunchApp {
+    param($PROFILE, $ArgsToForward)
+    $PROFILE_DIR = "$BASE\$PROFILE"
+
+    if (!(Test-Path $PROFILE_DIR)) {
+        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
+        exit 1
+    }
+
+    $appExec = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-AntigravityApp }
+    if ([string]::IsNullOrEmpty($appExec) -or !(Test-Path $appExec)) {
+        Write-Error "Error: Antigravity 2.0 app (Antigravity.exe) not found. Ensure Antigravity is installed or set MULTIGRAVITY_APP."
+        exit 1
+    }
+
+    Write-Host "Launching Antigravity 2.0 app profile '$PROFILE'"
+    
+    $env:USERPROFILE = $PROFILE_DIR
+    $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
+    $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+    
+    if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
+        Start-Process -FilePath $appExec -ArgumentList $ArgsToForward
+    }
+    else {
+        Start-Process -FilePath $appExec
+    }
+}
+
+function Invoke-LaunchAgy {
+    param($PROFILE, $ArgsToForward)
+    $PROFILE_DIR = "$BASE\$PROFILE"
+
+    if (!(Test-Path $PROFILE_DIR)) {
+        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
+        exit 1
+    }
+
+    $agyExec = if ($env:MULTIGRAVITY_AGY) { $env:MULTIGRAVITY_AGY } else { Find-Agy }
+    if ([string]::IsNullOrEmpty($agyExec) -or !(Test-Path $agyExec)) {
+        Write-Error "Error: agy CLI not found. Ensure agy is installed and in PATH or set MULTIGRAVITY_AGY."
+        exit 1
+    }
+
+    Write-Host "Launching agy CLI with profile '$PROFILE'..."
+
+    $prevUserProfile = $env:USERPROFILE
+    $prevAppData = $env:APPDATA
+    $prevLocalAppData = $env:LOCALAPPDATA
+
+    $env:USERPROFILE = $PROFILE_DIR
+    $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
+    $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+
+    try {
+        if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
+            & $agyExec @ArgsToForward
+        }
+        else {
+            & $agyExec
+        }
+    }
+    finally {
+        $env:USERPROFILE = $prevUserProfile
+        $env:APPDATA = $prevAppData
+        $env:LOCALAPPDATA = $prevLocalAppData
+    }
+}
+
+function Invoke-LaunchProfile {
+    param($PROFILE, $ArgsToForward)
+    Invoke-LaunchIde $PROFILE $ArgsToForward
 }
 
 function Invoke-ListProfiles {
@@ -205,8 +365,9 @@ function Invoke-CreateShortcut {
     $Shortcut = $WshShell.CreateShortcut($SHORTCUT_PATH)
     $Shortcut.TargetPath = "powershell.exe"
     $Shortcut.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -Command `"& '$SCRIPT_PATH' $PROFILE`""
-    if ($APP) {
-        $Shortcut.IconLocation = "$APP, 0"
+    $iconApp = if ($IDE_APP) { $IDE_APP } else { $APP }
+    if ($iconApp) {
+        $Shortcut.IconLocation = "$iconApp, 0"
     }
     $Shortcut.Save()
 
@@ -381,12 +542,28 @@ function Invoke-DoctorCli {
 
     Write-Host "Checking multigravity environment..."
 
-    # 1. Antigravity Installation
-    if ($APP -and (Test-Path $APP)) {
-        Write-Host "  [OK] Antigravity: Found at $APP"
+    # 1. Antigravity IDE Installation (Default)
+    if ($IDE_APP -and (Test-Path $IDE_APP)) {
+        Write-Host "  [OK] Antigravity IDE (default): Found at $IDE_APP"
     } else {
-        Write-Host "  [FAIL] Antigravity: Not found. Ensure it is installed or set MULTIGRAVITY_APP."
-        $errors++
+        Write-Host "  [WARN] Antigravity IDE: Not found. Will fall back to Antigravity App if present."
+        $warnings++
+    }
+
+    # 2. Antigravity 2.0 App Installation (--app)
+    if ($APP -and (Test-Path $APP)) {
+        Write-Host "  [OK] Antigravity 2.0 App (--app): Found at $APP"
+    } else {
+        Write-Host "  [WARN] Antigravity 2.0 App: Not found."
+        $warnings++
+    }
+
+    # 3. agy CLI Installation (terminal)
+    if ($AGY_APP -and (Test-Path $AGY_APP)) {
+        Write-Host "  [OK] agy CLI (terminal): Found at $AGY_APP"
+    } else {
+        Write-Host "  [WARN] agy CLI: Not found. Terminal mode will not be available."
+        $warnings++
     }
 
     # 2. Path Check
@@ -461,10 +638,10 @@ function Invoke-HelpCompletion {
 function Invoke-GenerateCompletion {
     param($shell)
     if ($shell -eq "powershell") {
-        @"
+@"
 Register-ArgumentCompleter -Native -CommandName multigravity -ScriptBlock {
     param(`$wordToComplete, `$commandAst, `$cursorPosition)
-    `$opts = @('new', 'list', 'status', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'completion', 'help')
+    `$opts = @('new', 'list', 'status', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'completion', 'help', 'agy', 'app', 'ide')
     `$profiles = if (Test-Path '$BASE') { Get-ChildItem -Directory -Path '$BASE' | Select-Object -ExpandProperty Name } else { @() }
     (`$opts + `$profiles) | Where-Object { `$_ -like "`$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new(`$_, `$_, 'ParameterValue', `$_)
@@ -531,7 +708,7 @@ function Invoke-StatusProfiles {
 
     foreach ($d in $dirs) {
         $running = "no"
-        $procs = Get-Process -Name "Antigravity" -ErrorAction SilentlyContinue
+        $procs = Get-Process -Name "Antigravity", "Antigravity IDE", "agy" -ErrorAction SilentlyContinue
         if ($procs) {
             foreach ($proc in $procs) {
                 try {
@@ -587,7 +764,7 @@ function Invoke-ImportProfile {
 
     $dest = "$BASE\$name"
     if (Test-Path $dest) {
-        Write-Error "Error: profile '$name' already exists — choose a different name or delete it first"
+        Write-Error "Error: profile '$name' already exists - choose a different name or delete it first"
         exit 1
     }
 
@@ -656,6 +833,36 @@ switch ($cmd) {
             Invoke-HelpCompletion
         }
     }
+    "agy" {
+        if ([string]::IsNullOrWhiteSpace($arg1)) {
+            Write-Error "Error: profile name required for agy command. Usage: multigravity agy <profile> [args]"
+            exit 1
+        }
+        $AllArgs = @()
+        if ($arg2)        { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchAgy $arg1 $AllArgs
+    }
+    "app" {
+        if ([string]::IsNullOrWhiteSpace($arg1)) {
+            Write-Error "Error: profile name required for app command. Usage: multigravity app <profile> [args]"
+            exit 1
+        }
+        $AllArgs = @()
+        if ($arg2)        { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchApp $arg1 $AllArgs
+    }
+    "ide" {
+        if ([string]::IsNullOrWhiteSpace($arg1)) {
+            Write-Error "Error: profile name required for ide command. Usage: multigravity ide <profile> [args]"
+            exit 1
+        }
+        $AllArgs = @()
+        if ($arg2)        { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchIde $arg1 $AllArgs
+    }
     "help"   { Write-Usage }
     "--help" { Write-Usage }
     "-h"     { Write-Usage }
@@ -665,9 +872,30 @@ switch ($cmd) {
     }
     default {
         $AllArgs = @()
-        if ($arg1)       { $AllArgs += $arg1 }
-        if ($arg2)       { $AllArgs += $arg2 }
+        if ($arg1)        { $AllArgs += $arg1 }
+        if ($arg2)        { $AllArgs += $arg2 }
         if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-        Invoke-LaunchProfile $cmd $AllArgs
+
+        $isApp = $false
+        $isCli = $false
+        $filteredArgs = @()
+
+        foreach ($a in $AllArgs) {
+            if ($a -eq "--app") {
+                $isApp = $true
+            } elseif ($a -eq "--cli" -or $a -eq "--terminal" -or $a -eq "agy") {
+                $isCli = $true
+            } else {
+                $filteredArgs += $a
+            }
+        }
+
+        if ($isCli) {
+            Invoke-LaunchAgy $cmd $filteredArgs
+        } elseif ($isApp) {
+            Invoke-LaunchApp $cmd $filteredArgs
+        } else {
+            Invoke-LaunchIde $cmd $filteredArgs
+        }
     }
 }

@@ -38,29 +38,36 @@ if (!$IN_PATH) {
     Write-Host ""
 }
 
-Write-Step "Downloading multigravity.ps1..."
-# Use -UseBasicParsing for compatibility with PS 5.1 on some systems
-# We download to a string first to ensure we can save with the correct encoding
-try {
-    $scriptContent = Invoke-WebRequest -Uri "$RAW/multigravity.ps1" -UseBasicParsing -ErrorAction Stop
-    [System.IO.File]::WriteAllText("$INSTALL_DIR\multigravity.ps1", $scriptContent.Content, [System.Text.Encoding]::UTF8)
-} catch {
-    Abort "Failed to download multigravity.ps1: $_"
+$localScript = Join-Path $PSScriptRoot "multigravity.ps1"
+if (Test-Path $localScript) {
+    Write-Step "Installing local multigravity.ps1..."
+    Copy-Item -Path $localScript -Destination "$INSTALL_DIR\multigravity.ps1" -Force
+} else {
+    Write-Step "Downloading multigravity.ps1..."
+    # Use -UseBasicParsing for compatibility with PS 5.1 on some systems
+    try {
+        $scriptContent = Invoke-WebRequest -Uri "$RAW/multigravity.ps1" -UseBasicParsing -ErrorAction Stop
+        [System.IO.File]::WriteAllText("$INSTALL_DIR\multigravity.ps1", $scriptContent.Content, [System.Text.Encoding]::UTF8)
+    } catch {
+        Abort "Failed to download multigravity.ps1: $_"
+    }
 }
 
-Write-Step "Creating wrapper script..."
-$wrapper = @"
-@echo off
-powershell.exe -ExecutionPolicy Bypass -File "%~dp0multigravity.ps1" %*
-"@
+Write-Step "Creating wrapper scripts..."
+$wrapper = "@echo off`r`npowershell.exe -ExecutionPolicy Bypass -File `"%~dp0multigravity.ps1`" %*`r`n"
+$agyWrapper = "@echo off`r`npowershell.exe -ExecutionPolicy Bypass -File `"%~dp0multigravity.ps1`" agy %*`r`n"
 
-# Save wrapper as ASCII for widest compatibility with cmd.exe
+# Save wrappers as ASCII for widest compatibility with cmd.exe
 [System.IO.File]::WriteAllText("$INSTALL_DIR\multigravity.cmd", $wrapper, [System.Text.Encoding]::ASCII)
+[System.IO.File]::WriteAllText("$INSTALL_DIR\agy-profile.cmd", $agyWrapper, [System.Text.Encoding]::ASCII)
 
 Write-Host ""
-Write-Host "✓ Multigravity installed successfully!"
+Write-Host "[OK] Multigravity installed successfully!"
 Write-Host ""
 Write-Host "Usage:"
 Write-Host "  multigravity help"
 Write-Host "  multigravity new <profile-name>"
-Write-Host "  multigravity <profile-name>"
+Write-Host "  multigravity <profile-name>         (Launches Antigravity IDE)"
+Write-Host "  multigravity <profile-name> --app   (Launches Antigravity 2.0 desktop app)"
+Write-Host "  multigravity agy <profile-name>     (Launches agy CLI in terminal)"
+Write-Host "  agy-profile <profile-name>          (Launches agy CLI in terminal)"

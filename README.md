@@ -36,35 +36,48 @@ irm https://raw.githubusercontent.com/sujitagarwal/multigravity-cli/main/install
 multigravity new work
 multigravity new personal
 
-# Launch a profile
+# 1. Launch in Antigravity IDE (VS Code-like IDE, default)
 multigravity work
-
-# Pass arguments straight through to Antigravity
 multigravity work .
 multigravity work path/to/project
-multigravity work --new-window
+
+# 2. Launch in Antigravity 2.0 desktop app
+multigravity work --app
+# or
+multigravity app work
+
+# 3. Launch agy CLI in terminal (no GUI app)
+multigravity agy work
+# or
+multigravity work --cli
+# or (Windows wrapper)
+agy-profile work
 ```
 
 Each profile gets an automatic clickable launcher:
 
-| Platform | Location |
-|----------|----------|
-| macOS    | `~/Applications/Multigravity <name>.app` |
-| Windows  | Start Menu → Programs |
-| Linux    | `~/.local/share/applications/multigravity-<name>.desktop` |
+| Platform | Location | Launches |
+|----------|----------|----------|
+| macOS    | `~/Applications/Multigravity <name>.app` | Antigravity IDE |
+| Windows  | Start Menu → Programs | Antigravity IDE |
+| Linux    | `~/.local/share/applications/multigravity-<name>.desktop` | Antigravity IDE |
 
 ---
 
 ## Commands
 
-### Profile Management
+### Profile Management & Launching
 
 | Command | Description |
 |---------|-------------|
 | `multigravity new <name>` | Create a new full profile |
 | `multigravity new <name> --shared` | Create a lightweight profile (shared extensions & settings, isolated accounts) |
 | `multigravity new <name> --from <template>` | Create a profile from a saved template |
-| `multigravity <name>` | Launch a profile |
+| `multigravity <name> [args]` | **Launch in Antigravity IDE** (VS Code-like IDE, default) |
+| `multigravity <name> --app [args]` | **Launch in Antigravity 2.0 app** |
+| `multigravity app <name> [args]` | Alias to launch in Antigravity 2.0 app |
+| `multigravity agy <name> [args]` | **Launch agy CLI in terminal** (isolated credentials & history) |
+| `multigravity <name> --cli [args]` | Alias to launch agy CLI in terminal |
 | `multigravity list` | List all profiles |
 | `multigravity status` | Show running state, type, last used, and size per profile |
 | `multigravity clone <src> <dest>` | Copy an existing profile |
@@ -125,6 +138,63 @@ multigravity new project-b --from base
 # See what templates you have
 multigravity template list
 ```
+
+---
+
+## Terminal `agy` Sessions
+
+When you want to work purely in your terminal with isolated `agy` accounts/history (without opening the desktop GUI):
+
+```bash
+# Launch agy in current terminal
+multigravity agy work
+# or
+multigravity work --cli
+```
+
+### Direct `agy <profile>` shell integration
+
+If you'd like to type `agy <profile-name>` directly in your terminal to launch a profile:
+
+**PowerShell (`notepad $PROFILE`):**
+```powershell
+function agy {
+    param([Parameter(ValueFromRemainingArguments = $true)]$args)
+    $base = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\AntigravityProfiles" }
+    if ($args.Count -gt 0 -and (Test-Path "$base\$($args[0])")) {
+        multigravity agy @args
+    } else {
+        & (Get-Command agy.exe -CommandType Application | Select-Object -First 1 -ExpandProperty Source) @args
+    }
+}
+```
+
+**macOS / Linux (`~/.zshrc` or `~/.bashrc`):**
+```bash
+agy() {
+  local base="${MULTIGRAVITY_HOME:-$HOME/AntigravityProfiles}"
+  if [ -n "${1-}" ] && [ -d "$base/$1" ]; then
+    multigravity agy "$@"
+  else
+    command agy "$@"
+  fi
+}
+```
+
+Now `agy work` starts the isolated `work` profile in your terminal, while normal commands like `agy --help` or `agy -c` work as usual.
+
+---
+
+## Environment Configuration
+
+You can override executable locations or storage paths via environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `MULTIGRAVITY_IDE` | Override Antigravity IDE (VS Code-like) executable path |
+| `MULTIGRAVITY_APP` | Override Antigravity 2.0 app executable path |
+| `MULTIGRAVITY_AGY` | Override `agy` CLI binary path |
+| `MULTIGRAVITY_HOME` | Override profile storage root (default: `~/AntigravityProfiles`) |
 
 ---
 
