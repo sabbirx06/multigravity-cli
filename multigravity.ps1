@@ -246,12 +246,13 @@ function Invoke-LaunchIde {
     $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
     $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
     
+    $ideDataDir = "$PROFILE_DIR\AppData\Roaming\Antigravity IDE"
+    $ideExtDir  = "$PROFILE_DIR\.antigravity-ide\extensions"
+    $launchArgs = @("--user-data-dir", "`"$ideDataDir`"", "--extensions-dir", "`"$ideExtDir`"")
     if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
-        Start-Process -FilePath $ideExec -ArgumentList $ArgsToForward
+        $launchArgs += $ArgsToForward
     }
-    else {
-        Start-Process -FilePath $ideExec
-    }
+    Start-Process -FilePath $ideExec -ArgumentList $launchArgs
 }
 
 function Invoke-LaunchApp {
@@ -275,12 +276,13 @@ function Invoke-LaunchApp {
     $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
     $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
     
+    $appDataDir = "$PROFILE_DIR\AppData\Roaming\Antigravity"
+    $appExtDir  = "$PROFILE_DIR\.antigravity\extensions"
+    $launchArgs = @("--user-data-dir", "`"$appDataDir`"", "--extensions-dir", "`"$appExtDir`"")
     if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
-        Start-Process -FilePath $appExec -ArgumentList $ArgsToForward
+        $launchArgs += $ArgsToForward
     }
-    else {
-        Start-Process -FilePath $appExec
-    }
+    Start-Process -FilePath $appExec -ArgumentList $launchArgs
 }
 
 function Invoke-LaunchAgy {
