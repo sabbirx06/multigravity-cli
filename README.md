@@ -152,6 +152,23 @@ multigravity agy work
 multigravity work --cli
 ```
 
+### Authenticating a Separate Account in an `agy` Profile
+
+On Windows and macOS, `agy` queries the operating system keyring (Credential Manager / Keychain) by default. If you have already signed into an account globally, a newly created profile may initially detect that existing system session.
+
+To switch or sign into a different Google account for your profile:
+1. In the launched `agy` terminal session, type:
+   ```text
+   /logout
+   ```
+2. Then type:
+   ```text
+   /login
+   ```
+3. Follow the OAuth prompt in your browser to sign into the target Google account. That profile now persists its own session independently.
+
+*(Optional)* You can also lock a profile to a specific Google account by saving the email address inside `~/AntigravityProfiles/<profile>/.account`.
+
 ### Direct `agy <profile>` shell integration
 
 If you'd like to type `agy <profile-name>` directly in your terminal to launch a profile:

@@ -532,6 +532,12 @@ launch_agy() {
   agy_bin="$(require_agy)"
 
   print_info "Launching agy CLI with profile '$profile'..."
+  print_info "Tip: To sign into a different Google account for this profile, type '/logout' then '/login' inside agy."
+
+  local prev_account="${AGY_ACCOUNT-}"
+  if [ -f "$profile_path/.account" ]; then
+    export AGY_ACCOUNT="$(head -n 1 "$profile_path/.account" | tr -d '\r\n')"
+  fi
 
   case "$(platform)" in
     darwin)
@@ -546,6 +552,12 @@ launch_agy() {
       "$agy_bin" "$@"
       ;;
   esac
+
+  if [ -n "$prev_account" ]; then
+    export AGY_ACCOUNT="$prev_account"
+  else
+    unset AGY_ACCOUNT || true
+  fi
 }
 
 launch_app() {

@@ -299,10 +299,20 @@ function Invoke-LaunchAgy {
     }
 
     Write-Host "Launching agy CLI with profile '$PROFILE'..."
+    Write-Host "Tip: To sign into a different Google account for this profile, type '/logout' then '/login' inside agy." -ForegroundColor DarkCyan
 
     $prevUserProfile = $env:USERPROFILE
     $prevAppData = $env:APPDATA
     $prevLocalAppData = $env:LOCALAPPDATA
+    $prevAgyAccount = $env:AGY_ACCOUNT
+
+    $accountFile = "$PROFILE_DIR\.account"
+    if (Test-Path $accountFile) {
+        $savedAccount = (Get-Content $accountFile -Raw).Trim()
+        if (![string]::IsNullOrEmpty($savedAccount)) {
+            $env:AGY_ACCOUNT = $savedAccount
+        }
+    }
 
     $env:USERPROFILE = $PROFILE_DIR
     $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
@@ -320,6 +330,7 @@ function Invoke-LaunchAgy {
         $env:USERPROFILE = $prevUserProfile
         $env:APPDATA = $prevAppData
         $env:LOCALAPPDATA = $prevLocalAppData
+        $env:AGY_ACCOUNT = $prevAgyAccount
     }
 }
 
