@@ -164,7 +164,12 @@ function agy {
     if ($args.Count -gt 0 -and (Test-Path "$base\$($args[0])")) {
         multigravity agy @args
     } else {
-        & (Get-Command agy.exe -CommandType Application | Select-Object -First 1 -ExpandProperty Source) @args
+        $realAgy = (Get-Command agy.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+        if ($realAgy) {
+            & $realAgy @args
+        } else {
+            & "$env:LOCALAPPDATA\agy\bin\agy.EXE" @args
+        }
     }
 }
 ```
