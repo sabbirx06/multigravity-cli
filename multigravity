@@ -515,6 +515,227 @@ remove_shortcut() {
   esac
 }
 
+gemini_cred_read() {
+  case "$(platform)" in
+    darwin)
+      security find-generic-password -s "gemini" -a "antigravity" -w 2>/dev/null || true
+      ;;
+    linux)
+      if command -v secret-tool >/dev/null 2>&1; then
+        secret-tool lookup service gemini username antigravity 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
+gemini_cred_write() {
+  local secret="$1"
+  [ -z "$secret" ] && return 0
+  case "$(platform)" in
+    darwin)
+      security add-generic-password -U -s "gemini" -a "antigravity" -w "$secret" 2>/dev/null || true
+      ;;
+    linux)
+      if command -v secret-tool >/dev/null 2>&1; then
+        printf '%s' "$secret" | secret-tool store --label="gemini" service gemini username antigravity 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
+gemini_cred_delete() {
+  case "$(platform)" in
+    darwin)
+      security delete-generic-password -s "gemini" -a "antigravity" 2>/dev/null || true
+      ;;
+    linux)
+      if command -v secret-tool >/dev/null 2>&1; then
+        secret-tool clear service gemini username antigravity 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
+extract_email_from_token() {
+  local json_str="$1"
+  [ -z "$json_str" ] && return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import sys, json, base64;
+try:
+  data = json.loads(sys.argv[1])
+  tok = data.get('id_token', '')
+  if tok:
+    parts = tok.split('.')
+    if len(parts) >= 2:
+      p = parts[1].replace('-', '+').replace('_', '/')
+      p += '=' * (-len(p) % 4)
+      claims = json.loads(base64.b64decode(p).decode('utf-8'))
+      print(claims.get('email', ''))
+except: pass" "$json_str" 2>/dev/null || true
+  elif command -v node >/dev/null 2>&1; then
+    node -e "try {
+      const data = JSON.parse(process.argv[1]);
+      if (data && data.id_token) {
+        const payload = data.id_token.split('.')[1];
+        const json = Buffer.from(payload, 'base64').toString('utf8');
+        console.log(JSON.parse(json).email || '');
+      }
+    } catch(e) {}" "$json_str" 2>/dev/null || true
+  fi
+}
+
+save_profile_vault() {
+  local profile=$1
+  local profile_path
+  profile_path="$(profile_dir "$profile")"
+  [ -d "$profile_path" ] || return 0
+
+  local current
+  current="$(gemini_cred_read)"
+  if [ -n "$current" ]; then
+    printf '%s' "$current" > "$profile_path/.auth_vault"
+    local email
+    email="$(extract_email_from_token "$current")"
+    if [ -n "$email" ]; then
+      printf '%s' "$email" > "$profile_path/.account"
+      print_info "  [auth] Saved session for profile '$profile' ($email)"
+    else
+      print_info "  [auth] Saved session for profile '$profile'"
+    fi
+  else
+    rm -f "$profile_path/.auth_vault" "$profile_path/.account"
+    print_info "  [auth] Session cleared for profile '$profile'"
+  fi
+}
+
+prepare_profile_vault() {
+  local profile=$1
+  local profile_path
+  profile_path="$(profile_dir "$profile")"
+
+  local current_sys
+  current_sys="$(gemini_cred_read)"
+  if [ -n "$current_sys" ] && [ ! -f "$BASE/.system_auth_vault" ]; then
+    printf '%s' "$current_sys" > "$BASE/.system_auth_vault"
+  fi
+
+  local vault_file="$profile_path/.auth_vault"
+  if [ -f "$vault_file" ]; then
+    local saved
+    saved="$(cat "$vault_file" 2>/dev/null || true)"
+    if [ -n "$saved" ]; then
+      gemini_cred_write "$saved"
+      local email
+      email="$(extract_email_from_token "$saved")"
+      if [ -n "$email" ]; then
+        printf '%s' "$email" > "$profile_path/.account"
+        print_info "  [auth] Restored session for profile '$profile' ($email)"
+      else
+        print_info "  [auth] Restored session for profile '$profile'"
+      fi
+      return 0
+    fi
+  fi
+
+  gemini_cred_delete
+  print_info "  [auth] Profile '$profile' has no saved session. Ready for clean login."
+}
+
+auth_cmd() {
+  local sub="${1-}" profile="${2-}"
+  case "$sub" in
+    save)
+      [ -n "$profile" ] || abort "profile name required. Usage: multigravity auth save <profile>"
+      validate_name "$profile"
+      local profile_path
+      profile_path="$(profile_dir "$profile")"
+      [ -d "$profile_path" ] || abort "profile '$profile' does not exist"
+      local current
+      current="$(gemini_cred_read)"
+      [ -n "$current" ] || { print_info "No active Antigravity session found in system keyring."; return 0; }
+      printf '%s' "$current" > "$profile_path/.auth_vault"
+      local email
+      email="$(extract_email_from_token "$current")"
+      if [ -n "$email" ]; then
+        printf '%s' "$email" > "$profile_path/.account"
+        print_info "Saved active authentication session to profile '$profile' ($email)"
+      else
+        print_info "Saved active authentication session to profile '$profile'"
+      fi
+      ;;
+    load)
+      [ -n "$profile" ] || abort "profile name required. Usage: multigravity auth load <profile>"
+      validate_name "$profile"
+      local profile_path
+      profile_path="$(profile_dir "$profile")"
+      local vault_file="$profile_path/.auth_vault"
+      [ -f "$vault_file" ] || abort "profile '$profile' has no saved session in .auth_vault"
+      local saved
+      saved="$(cat "$vault_file" 2>/dev/null || true)"
+      [ -n "$saved" ] || abort "saved session for profile '$profile' is empty"
+      gemini_cred_write "$saved"
+      local email
+      email="$(extract_email_from_token "$saved")"
+      if [ -n "$email" ]; then
+        print_info "Activated authentication session for profile '$profile' ($email)"
+      else
+        print_info "Activated authentication session for profile '$profile'"
+      fi
+      ;;
+    status)
+      print_info "Multigravity Profile Authentication Status:"
+      echo ""
+      local active_cred active_email=""
+      active_cred="$(gemini_cred_read)"
+      if [ -n "$active_cred" ]; then
+        active_email="$(extract_email_from_token "$active_cred")"
+        if [ -n "$active_email" ]; then
+          print_info "Currently Active System Session: $active_email"
+        else
+          print_info "Currently Active System Session: (token present, unparsed)"
+        fi
+      else
+        print_info "Currently Active System Session: (none / logged out)"
+      fi
+      echo ""
+      printf "%-20s %-30s %s\n" "PROFILE" "VAULT ACCOUNT" "STATUS"
+      printf "%-20s %-30s %s\n" "-------" "-------------" "------"
+      if [ -d "$BASE" ]; then
+        for dir in "$BASE"/*; do
+          [ -d "$dir" ] || continue
+          local name
+          name=$(basename "$dir")
+          [ "$name" = ".templates" ] && continue
+          local email="-" status="empty"
+          if [ -f "$dir/.account" ]; then
+            email="$(head -n 1 "$dir/.account" | tr -d '\r\n')"
+          elif [ -f "$dir/.auth_vault" ]; then
+            email="$(extract_email_from_token "$(cat "$dir/.auth_vault" 2>/dev/null || true)")"
+            [ -z "$email" ] && email="-"
+          fi
+          [ -f "$dir/.auth_vault" ] && status="saved"
+          if [ "$email" != "-" ] && [ "$email" = "$active_email" ]; then
+            printf "%-20s %-30s active\n" "$name" "$email"
+          else
+            printf "%-20s %-30s %s\n" "$name" "$email" "$status"
+          fi
+        done
+      fi
+      ;;
+    clear)
+      [ -n "$profile" ] || abort "profile name required. Usage: multigravity auth clear <profile>"
+      validate_name "$profile"
+      local profile_path
+      profile_path="$(profile_dir "$profile")"
+      rm -f "$profile_path/.auth_vault" "$profile_path/.account"
+      print_info "Cleared saved session for profile '$profile'"
+      ;;
+    *)
+      print_info "Usage: multigravity auth <save|load|status|clear> [profile]"
+      ;;
+  esac
+}
+
 launch_agy() {
   local profile=$1
   shift || true
@@ -539,9 +760,15 @@ launch_agy() {
     export AGY_ACCOUNT="$(head -n 1 "$profile_path/.account" | tr -d '\r\n')"
   fi
 
+  local prev_cred
+  prev_cred="$(gemini_cred_read)"
+
+  prepare_profile_vault "$profile"
+
+  local exit_code=0
   case "$(platform)" in
     darwin)
-      HOME="$profile_path" "$agy_bin" "$@"
+      HOME="$profile_path" "$agy_bin" "$@" || exit_code=$?
       ;;
     linux)
       HOME="$profile_path" \
@@ -549,15 +776,29 @@ launch_agy() {
       XDG_CACHE_HOME="$profile_path/.cache" \
       XDG_DATA_HOME="$profile_path/.local/share" \
       XDG_STATE_HOME="$profile_path/.local/state" \
-      "$agy_bin" "$@"
+      "$agy_bin" "$@" || exit_code=$?
       ;;
   esac
+
+  save_profile_vault "$profile"
+
+  if [ -n "$prev_cred" ]; then
+    gemini_cred_write "$prev_cred"
+  elif [ -f "$BASE/.system_auth_vault" ]; then
+    local sys_cred
+    sys_cred="$(cat "$BASE/.system_auth_vault" 2>/dev/null || true)"
+    if [ -n "$sys_cred" ]; then
+      gemini_cred_write "$sys_cred"
+    fi
+  fi
 
   if [ -n "$prev_account" ]; then
     export AGY_ACCOUNT="$prev_account"
   else
     unset AGY_ACCOUNT || true
   fi
+
+  return $exit_code
 }
 
 launch_app() {
@@ -581,6 +822,8 @@ launch_app() {
   ext_dir="$(extensions_dir "$profile_path")"
 
   print_info "Launching Antigravity 2.0 app profile '$profile'"
+
+  prepare_profile_vault "$profile"
 
   case "$(platform)" in
     darwin)
@@ -624,6 +867,8 @@ launch_ide() {
   ext_dir="$(extensions_dir "$profile_path")"
 
   print_info "Launching Antigravity IDE profile '$profile'"
+
+  prepare_profile_vault "$profile"
 
   case "$(platform)" in
     darwin)
@@ -942,8 +1187,8 @@ status_profiles() {
     return 0
   fi
 
-  printf "%-18s %-10s %-12s %-20s %s\n" "PROFILE" "RUNNING" "TYPE" "LAST USED" "SIZE"
-  printf "%-18s %-10s %-12s %-20s %s\n" "-------" "-------" "----" "---------" "----"
+  printf "%-16s %-26s %-9s %-8s %-17s %s\n" "PROFILE" "ACCOUNT" "RUNNING" "TYPE" "LAST USED" "SIZE"
+  printf "%-16s %-26s %-9s %-8s %-17s %s\n" "-------" "-------" "-------" "----" "---------" "----"
 
   local dir
   for dir in "$BASE"/*; do
@@ -971,10 +1216,21 @@ status_profiles() {
     local size
     size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
 
+    local account="-"
+    if [ -f "$dir/.account" ]; then
+      account="$(head -n 1 "$dir/.account" | tr -d '\r\n')"
+    elif [ -f "$dir/.auth_vault" ]; then
+      account="$(extract_email_from_token "$(cat "$dir/.auth_vault" 2>/dev/null || true)")"
+      [ -z "$account" ] && account="-"
+    fi
+    if [ ${#account} -gt 25 ]; then
+      account="${account:0:22}..."
+    fi
+
     if [ "$running" = "yes" ]; then
-      printf "%-18s \033[32m%-10s\033[0m %-12s %-20s %s\n" "$name" "$running" "$ptype" "$last_used" "$size"
+      printf "%-16s %-26s \033[32m%-9s\033[0m %-8s %-17s %s\n" "$name" "$account" "$running" "$ptype" "$last_used" "$size"
     else
-      printf "%-18s %-10s %-12s %-20s %s\n" "$name" "$running" "$ptype" "$last_used" "$size"
+      printf "%-16s %-26s %-9s %-8s %-17s %s\n" "$name" "$account" "$running" "$ptype" "$last_used" "$size"
     fi
   done
 }
@@ -1174,7 +1430,7 @@ _multigravity_completions() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="new list status rename delete clone template export import update doctor stats completion help"
+    opts="new list status auth rename delete clone template export import update doctor stats completion help"
 
     if [[ ${COMP_CWORD} -eq 1 ]] ; then
         local profiles=$(multigravity list --raw 2>/dev/null)
@@ -1214,6 +1470,10 @@ Commands:
   template save <profile> <name>   Save a profile as a reusable template
   template list               List saved templates
   template delete <name>      Delete a template
+  auth save <name>            Save current active session to profile vault
+  auth load <name>            Load profile vault into active system session
+  auth status                 Show saved authentication accounts for all profiles
+  auth clear <name>           Clear saved session for a profile
   export <name> [path]        Archive a profile to tar.gz
   import <archive> [name]     Restore a profile from a tar.gz archive
   update                      Update multigravity to the latest version
@@ -1259,6 +1519,10 @@ case "$cmd" in
   template)
     shift
     template_cmd "$@"
+    ;;
+  auth)
+    shift
+    auth_cmd "$@"
     ;;
   export)
     export_profile "${2-}" "${3-}"

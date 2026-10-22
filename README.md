@@ -92,6 +92,15 @@ Each profile gets an automatic clickable launcher:
 | `multigravity template list` | List saved templates |
 | `multigravity template delete <name>` | Remove a template |
 
+### Authentication & Session Vaults
+
+| Command | Description |
+|---------|-------------|
+| `multigravity auth status` | Show saved accounts and active session status across all profiles |
+| `multigravity auth save <name>` | Save currently active system session to a profile's vault |
+| `multigravity auth load <name>` | Activate a profile's vault session into the system keyring |
+| `multigravity auth clear <name>` | Clear a profile's saved authentication vault |
+
 ### Backup & Transfer
 
 | Command | Description |
@@ -152,22 +161,14 @@ multigravity agy work
 multigravity work --cli
 ```
 
-### Authenticating a Separate Account in an `agy` Profile
+### Profile Account Isolation & Credential Vaulting
 
-On Windows and macOS, `agy` queries the operating system keyring (Credential Manager / Keychain) by default. If you have already signed into an account globally, a newly created profile may initially detect that existing system session.
+Antigravity stores Google OAuth authentication tokens in the operating system keyring (Windows Credential Manager / macOS Keychain) under a global key (`gemini:antigravity`). Normally, logging into a second profile overwrites your first profile's session.
 
-To switch or sign into a different Google account for your profile:
-1. In the launched `agy` terminal session, type:
-   ```text
-   /logout
-   ```
-2. Then type:
-   ```text
-   /login
-   ```
-3. Follow the OAuth prompt in your browser to sign into the target Google account. That profile now persists its own session independently.
-
-*(Optional)* You can also lock a profile to a specific Google account by saving the email address inside `~/AntigravityProfiles/<profile>/.account`.
+**Multigravity solves this with Automatic Credential Vaulting:**
+- **On launch:** Multigravity automatically restores the target profile's session (`<profile>/.auth_vault`) into the system keyring. If the profile is brand new, it provides a clean login environment without leaking your existing account.
+- **On exit (`agy`):** Multigravity automatically captures any new or refreshed OAuth token, writes it to the profile's `.auth_vault`, auto-detects your email for `.account`, and restores your previous session.
+- **Check status anytime:** Run `multigravity auth status` or `multigravity status` to see the logged-in email and vault status for every profile.
 
 ### Direct `agy <profile>` shell integration
 

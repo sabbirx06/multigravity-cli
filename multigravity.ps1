@@ -100,6 +100,305 @@ function Test-SharedProfile {
     return Test-Path "$BASE\$name\.shared"
 }
 
+if (-not ([System.Management.Automation.PSTypeName]'Multigravity.CredHelper').Type) {
+    $credHelperSrc = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Multigravity {
+    public class CredHelper {
+        public const uint CRED_TYPE_GENERIC = 1;
+        public const uint CRED_PERSIST_LOCAL_MACHINE = 2;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct CREDENTIAL {
+            public uint Flags;
+            public uint Type;
+            public string TargetName;
+            public string Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public uint CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public uint Persist;
+            public uint AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias;
+            public string UserName;
+        }
+
+        [DllImport("Advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool CredRead(string target, uint type, int reservedFlag, out IntPtr credentialPtr);
+
+        [DllImport("Advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool CredWrite([In] ref CREDENTIAL credential, uint flags);
+
+        [DllImport("Advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool CredDelete(string target, uint type, uint flags);
+
+        [DllImport("Advapi32.dll", SetLastError = true)]
+        public static extern void CredFree(IntPtr cred);
+
+        public static string Read(string target) {
+            IntPtr ptr;
+            if (!CredRead(target, CRED_TYPE_GENERIC, 0, out ptr)) return null;
+            try {
+                var cred = (CREDENTIAL)Marshal.PtrToStructure(ptr, typeof(CREDENTIAL));
+                byte[] bytes = new byte[cred.CredentialBlobSize];
+                Marshal.Copy(cred.CredentialBlob, bytes, 0, (int)cred.CredentialBlobSize);
+                return System.Text.Encoding.UTF8.GetString(bytes);
+            } finally {
+                CredFree(ptr);
+            }
+        }
+
+        public static bool Write(string target, string userName, string secret) {
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(secret);
+            IntPtr blobPtr = Marshal.AllocHGlobal(bytes.Length);
+            try {
+                Marshal.Copy(bytes, 0, blobPtr, bytes.Length);
+                CREDENTIAL cred = new CREDENTIAL {
+                    Flags = 0,
+                    Type = CRED_TYPE_GENERIC,
+                    TargetName = target,
+                    Comment = "Multigravity Managed Credential",
+                    CredentialBlobSize = (uint)bytes.Length,
+                    CredentialBlob = blobPtr,
+                    Persist = CRED_PERSIST_LOCAL_MACHINE,
+                    AttributeCount = 0,
+                    Attributes = IntPtr.Zero,
+                    TargetAlias = null,
+                    UserName = userName
+                };
+                return CredWrite(ref cred, 0);
+            } finally {
+                Marshal.FreeHGlobal(blobPtr);
+            }
+        }
+
+        public static bool Delete(string target) {
+            return CredDelete(target, CRED_TYPE_GENERIC, 0);
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $credHelperSrc -ErrorAction SilentlyContinue
+}
+
+$GEMINI_CRED_TARGET = "gemini:antigravity"
+$GEMINI_CRED_USER   = "antigravity"
+
+function Get-GeminiCredential {
+    try {
+        return [Multigravity.CredHelper]::Read($GEMINI_CRED_TARGET)
+    } catch {
+        return $null
+    }
+}
+
+function Set-GeminiCredential {
+    param([string]$secret)
+    if ([string]::IsNullOrEmpty($secret)) { return $false }
+    try {
+        return [Multigravity.CredHelper]::Write($GEMINI_CRED_TARGET, $GEMINI_CRED_USER, $secret)
+    } catch {
+        return $false
+    }
+}
+
+function Remove-GeminiCredential {
+    try {
+        return [Multigravity.CredHelper]::Delete($GEMINI_CRED_TARGET)
+    } catch {
+        return $false
+    }
+}
+
+function Get-EmailFromCredential {
+    param([string]$credJson)
+    if ([string]::IsNullOrEmpty($credJson)) { return $null }
+    try {
+        $data = $credJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($data -and $data.id_token) {
+            $parts = $data.id_token.Split('.')
+            if ($parts.Length -ge 2) {
+                $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+                while ($payload.Length % 4 -ne 0) { $payload += "=" }
+                $bytes = [Convert]::FromBase64String($payload)
+                $claims = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($claims -and $claims.email) {
+                    return $claims.email
+                }
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Save-ProfileVault {
+    param($profileName)
+    $profileDir = "$BASE\$profileName"
+    if (!(Test-Path $profileDir)) { return }
+    $current = Get-GeminiCredential
+    if (![string]::IsNullOrEmpty($current)) {
+        Set-Content -Path "$profileDir\.auth_vault" -Value $current -NoNewline -Encoding UTF8 -Force
+        $email = Get-EmailFromCredential $current
+        if (![string]::IsNullOrEmpty($email)) {
+            Set-Content -Path "$profileDir\.account" -Value $email -NoNewline -Encoding UTF8 -Force
+            Write-Host "  [auth] Saved session for profile '$profileName' ($email)" -ForegroundColor Green
+        } else {
+            Write-Host "  [auth] Saved session for profile '$profileName'" -ForegroundColor Green
+        }
+    } else {
+        if (Test-Path "$profileDir\.auth_vault") {
+            Remove-Item "$profileDir\.auth_vault" -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path "$profileDir\.account") {
+            Remove-Item "$profileDir\.account" -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "  [auth] Session cleared for profile '$profileName'" -ForegroundColor DarkYellow
+    }
+}
+
+function Prepare-ProfileVault {
+    param($profileName)
+    $profileDir = "$BASE\$profileName"
+    $vaultFile = "$profileDir\.auth_vault"
+    $sysVaultFile = "$BASE\.system_auth_vault"
+
+    $currentSys = Get-GeminiCredential
+    if (![string]::IsNullOrEmpty($currentSys)) {
+        if (!(Test-Path $sysVaultFile)) {
+            Set-Content -Path $sysVaultFile -Value $currentSys -NoNewline -Encoding UTF8 -Force
+        }
+    }
+
+    if (Test-Path $vaultFile) {
+        $saved = (Get-Content -Path $vaultFile -Raw -Encoding UTF8).Trim()
+        if (![string]::IsNullOrEmpty($saved)) {
+            Set-GeminiCredential $saved | Out-Null
+            $email = Get-EmailFromCredential $saved
+            if (![string]::IsNullOrEmpty($email)) {
+                Set-Content -Path "$profileDir\.account" -Value $email -NoNewline -Encoding UTF8 -Force
+                Write-Host "  [auth] Restored session for profile '$profileName' ($email)" -ForegroundColor Cyan
+            } else {
+                Write-Host "  [auth] Restored session for profile '$profileName'" -ForegroundColor Cyan
+            }
+            return
+        }
+    }
+
+    Remove-GeminiCredential | Out-Null
+    Write-Host "  [auth] Profile '$profileName' has no saved session. Ready for clean login." -ForegroundColor Yellow
+}
+
+function Invoke-AuthCmd {
+    param($sub, $name)
+    switch ($sub) {
+        "save" {
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                Write-Error "Error: profile name required. Usage: multigravity auth save <profile>"
+                exit 1
+            }
+            Validate-Name $name
+            $profileDir = "$BASE\$name"
+            if (!(Test-Path $profileDir)) {
+                Write-Error "Error: profile '$name' does not exist"
+                exit 1
+            }
+            $current = Get-GeminiCredential
+            if ([string]::IsNullOrEmpty($current)) {
+                Write-Host "No active Antigravity session found in Credential Manager." -ForegroundColor Yellow
+                return
+            }
+            Set-Content -Path "$profileDir\.auth_vault" -Value $current -NoNewline -Encoding UTF8 -Force
+            $email = Get-EmailFromCredential $current
+            if (![string]::IsNullOrEmpty($email)) {
+                Set-Content -Path "$profileDir\.account" -Value $email -NoNewline -Encoding UTF8 -Force
+                Write-Host "Saved active authentication session to profile '$name' ($email)" -ForegroundColor Green
+            } else {
+                Write-Host "Saved active authentication session to profile '$name'" -ForegroundColor Green
+            }
+        }
+        "load" {
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                Write-Error "Error: profile name required. Usage: multigravity auth load <profile>"
+                exit 1
+            }
+            Validate-Name $name
+            $profileDir = "$BASE\$name"
+            $vaultFile = "$profileDir\.auth_vault"
+            if (!(Test-Path $vaultFile)) {
+                Write-Error "Error: profile '$name' has no saved session in .auth_vault"
+                exit 1
+            }
+            $saved = (Get-Content -Path $vaultFile -Raw -Encoding UTF8).Trim()
+            if ([string]::IsNullOrEmpty($saved)) {
+                Write-Error "Error: saved session for profile '$name' is empty"
+                exit 1
+            }
+            Set-GeminiCredential $saved | Out-Null
+            $email = Get-EmailFromCredential $saved
+            if (![string]::IsNullOrEmpty($email)) {
+                Write-Host "Activated authentication session for profile '$name' ($email)" -ForegroundColor Green
+            } else {
+                Write-Host "Activated authentication session for profile '$name'" -ForegroundColor Green
+            }
+        }
+        "status" {
+            Write-Host "Multigravity Profile Authentication Status:"
+            Write-Host ""
+            $activeCred = Get-GeminiCredential
+            $activeEmail = if ($activeCred) { Get-EmailFromCredential $activeCred } else { $null }
+            if ($activeEmail) {
+                Write-Host "Currently Active System Session: $activeEmail" -ForegroundColor Cyan
+            } elseif ($activeCred) {
+                Write-Host "Currently Active System Session: (token present, unparsed)" -ForegroundColor Cyan
+            } else {
+                Write-Host "Currently Active System Session: (none / logged out)" -ForegroundColor DarkGray
+            }
+            Write-Host ""
+            Write-Host ("{0,-20} {1,-30} {2}" -f "PROFILE", "VAULT ACCOUNT", "STATUS")
+            Write-Host ("{0,-20} {1,-30} {2}" -f "-------", "-------------", "------")
+            if (Test-Path $BASE) {
+                $profiles = Get-ChildItem -Directory -Path $BASE | Where-Object { $_.PSIsContainer -and $_.Name -ne ".templates" }
+                foreach ($p in $profiles) {
+                    $vaultFile = Join-Path $p.FullName ".auth_vault"
+                    $accountFile = Join-Path $p.FullName ".account"
+                    $email = "-"
+                    if (Test-Path $accountFile) {
+                        $email = (Get-Content $accountFile -Raw).Trim()
+                    } elseif (Test-Path $vaultFile) {
+                        $vData = Get-Content $vaultFile -Raw -Encoding UTF8
+                        $parsed = Get-EmailFromCredential $vData
+                        if ($parsed) { $email = $parsed }
+                    }
+                    $status = if (Test-Path $vaultFile) { "saved" } else { "empty" }
+                    if ($email -ne "-" -and $email -eq $activeEmail) {
+                        Write-Host ("{0,-20} {1,-30} " -f $p.Name, $email) -NoNewline
+                        Write-Host "active" -ForegroundColor Green
+                    } else {
+                        Write-Host ("{0,-20} {1,-30} {2}" -f $p.Name, $email, $status)
+                    }
+                }
+            }
+        }
+        "clear" {
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                Write-Error "Error: profile name required. Usage: multigravity auth clear <profile>"
+                exit 1
+            }
+            Validate-Name $name
+            $profileDir = "$BASE\$name"
+            if (Test-Path "$profileDir\.auth_vault") { Remove-Item "$profileDir\.auth_vault" -Force }
+            if (Test-Path "$profileDir\.account") { Remove-Item "$profileDir\.account" -Force }
+            Write-Host "Cleared saved session for profile '$name'"
+        }
+        default {
+            Write-Host "Usage: multigravity auth <save|load|status|clear> [profile]"
+        }
+    }
+}
+
 function Write-Usage {
     Write-Host "Usage: multigravity <command> [args]"
     Write-Host ""
@@ -115,6 +414,10 @@ function Write-Usage {
     Write-Host "  template save <profile> <name>   Save a profile as a reusable template"
     Write-Host "  template list               List saved templates"
     Write-Host "  template delete <name>      Remove a template"
+    Write-Host "  auth save <name>            Save current active session to profile vault"
+    Write-Host "  auth load <name>            Load profile vault into active system session"
+    Write-Host "  auth status                 Show saved authentication accounts for all profiles"
+    Write-Host "  auth clear <name>           Clear saved session for a profile"
     Write-Host "  export <name> [path]        Archive a profile to a .zip file"
     Write-Host "  import <archive> [name]     Restore a profile from a .zip archive"
     Write-Host "  update                      Update multigravity to the latest version"
@@ -252,6 +555,8 @@ function Invoke-LaunchIde {
     if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
         $launchArgs += $ArgsToForward
     }
+
+    Prepare-ProfileVault $PROFILE
     Start-Process -FilePath $ideExec -ArgumentList $launchArgs
 }
 
@@ -282,6 +587,8 @@ function Invoke-LaunchApp {
     if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
         $launchArgs += $ArgsToForward
     }
+
+    Prepare-ProfileVault $PROFILE
     Start-Process -FilePath $appExec -ArgumentList $launchArgs
 }
 
@@ -307,6 +614,7 @@ function Invoke-LaunchAgy {
     $prevAppData = $env:APPDATA
     $prevLocalAppData = $env:LOCALAPPDATA
     $prevAgyAccount = $env:AGY_ACCOUNT
+    $prevCred = Get-GeminiCredential
 
     $accountFile = "$PROFILE_DIR\.account"
     if (Test-Path $accountFile) {
@@ -320,6 +628,8 @@ function Invoke-LaunchAgy {
     $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
     $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
 
+    Prepare-ProfileVault $PROFILE
+
     try {
         if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
             & $agyExec @ArgsToForward
@@ -329,6 +639,17 @@ function Invoke-LaunchAgy {
         }
     }
     finally {
+        Save-ProfileVault $PROFILE
+
+        if (![string]::IsNullOrEmpty($prevCred)) {
+            Set-GeminiCredential $prevCred | Out-Null
+        } elseif (Test-Path "$BASE\.system_auth_vault") {
+            $sys = (Get-Content -Path "$BASE\.system_auth_vault" -Raw -Encoding UTF8).Trim()
+            if (![string]::IsNullOrEmpty($sys)) {
+                Set-GeminiCredential $sys | Out-Null
+            }
+        }
+
         $env:USERPROFILE = $prevUserProfile
         $env:APPDATA = $prevAppData
         $env:LOCALAPPDATA = $prevLocalAppData
@@ -654,7 +975,7 @@ function Invoke-GenerateCompletion {
 @"
 Register-ArgumentCompleter -Native -CommandName multigravity -ScriptBlock {
     param(`$wordToComplete, `$commandAst, `$cursorPosition)
-    `$opts = @('new', 'list', 'status', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'completion', 'help', 'agy', 'app', 'ide')
+    `$opts = @('new', 'list', 'status', 'auth', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'completion', 'help', 'agy', 'app', 'ide')
     `$profiles = if (Test-Path '$BASE') { Get-ChildItem -Directory -Path '$BASE' | Select-Object -ExpandProperty Name } else { @() }
     (`$opts + `$profiles) | Where-Object { `$_ -like "`$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new(`$_, `$_, 'ParameterValue', `$_)
@@ -713,8 +1034,8 @@ function Invoke-TemplateCmd {
 function Invoke-StatusProfiles {
     if (!(Test-Path $BASE)) { Write-Host "No profiles found."; return }
 
-    Write-Host ("{0,-18} {1,-10} {2,-12} {3,-20} {4}" -f "PROFILE", "RUNNING", "TYPE", "LAST USED", "SIZE")
-    Write-Host ("{0,-18} {1,-10} {2,-12} {3,-20} {4}" -f "-------", "-------", "----", "---------", "----")
+    Write-Host ("{0,-16} {1,-26} {2,-9} {3,-8} {4,-17} {5}" -f "PROFILE", "ACCOUNT", "RUNNING", "TYPE", "LAST USED", "SIZE")
+    Write-Host ("{0,-16} {1,-26} {2,-9} {3,-8} {4,-17} {5}" -f "-------", "-------", "-------", "----", "---------", "----")
 
     $dirs = Get-ChildItem -Directory -Path $BASE -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne ".templates" }
@@ -734,13 +1055,22 @@ function Invoke-StatusProfiles {
         $ptype    = if (Test-Path "$($d.FullName)\.shared") { "shared" } else { "full" }
         $lastUsed = $d.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
         $size     = Get-FolderSize $d.FullName
+        $account  = "-"
+        $accFile  = Join-Path $d.FullName ".account"
+        if (Test-Path $accFile) {
+            $account = (Get-Content $accFile -Raw).Trim()
+        } elseif (Test-Path (Join-Path $d.FullName ".auth_vault")) {
+            $parsed = Get-EmailFromCredential (Get-Content (Join-Path $d.FullName ".auth_vault") -Raw -Encoding UTF8)
+            if ($parsed) { $account = $parsed }
+        }
+        if ($account.Length -gt 25) { $account = $account.Substring(0, 22) + "..." }
 
         if ($running -eq "yes") {
-            Write-Host ("{0,-18} " -f $d.Name) -NoNewline
-            Write-Host ("{0,-10} " -f $running) -NoNewline -ForegroundColor Green
-            Write-Host ("{0,-12} {1,-20} {2}" -f $ptype, $lastUsed, $size)
+            Write-Host ("{0,-16} {1,-26} " -f $d.Name, $account) -NoNewline
+            Write-Host ("{0,-9} " -f $running) -NoNewline -ForegroundColor Green
+            Write-Host ("{0,-8} {1,-17} {2}" -f $ptype, $lastUsed, $size)
         } else {
-            Write-Host ("{0,-18} {1,-10} {2,-12} {3,-20} {4}" -f $d.Name, $running, $ptype, $lastUsed, $size)
+            Write-Host ("{0,-16} {1,-26} {2,-9} {3,-8} {4,-17} {5}" -f $d.Name, $account, $running, $ptype, $lastUsed, $size)
         }
     }
 }
@@ -838,6 +1168,9 @@ switch ($cmd) {
     }
     "stats" {
         Invoke-ProfileStats
+    }
+    "auth" {
+        Invoke-AuthCmd $arg1 $arg2
     }
     "completion" {
         if ($arg1) {
