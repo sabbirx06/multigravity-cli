@@ -218,6 +218,9 @@ function Get-EmailFromCredential {
     if ([string]::IsNullOrEmpty($credJson)) { return $null }
     try {
         $data = $credJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($data -and $data.id_token_email) {
+            return $data.id_token_email
+        }
         if ($data -and $data.id_token) {
             $parts = $data.id_token.Split('.')
             if ($parts.Length -ge 2) {
