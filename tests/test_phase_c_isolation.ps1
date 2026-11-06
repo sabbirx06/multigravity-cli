@@ -381,7 +381,7 @@ $user = $env:USERPROFILE
         Invoke-NewProfile $testProf @() | Out-Null
 
         $mockAgy = Join-Path $TEST_BASE "mock_agy2.cmd"
-        Set-Content -Path $mockAgy -Value "@echo mock agy executed" -Encoding UTF8
+        Set-Content -Path $mockAgy -Value "@echo mock agy executed" -Encoding ASCII
 
         $oldAgy = $env:MULTIGRAVITY_AGY
         $env:MULTIGRAVITY_AGY = $mockAgy
@@ -436,7 +436,7 @@ $user = $env:USERPROFILE
         Invoke-NewProfile $testProfNoBind @() | Out-Null
 
         $mockAgy = Join-Path $TEST_BASE "mock_agy3.cmd"
-        Set-Content -Path $mockAgy -Value "@echo mock agy executed" -Encoding UTF8
+        Set-Content -Path $mockAgy -Value "@echo mock agy executed" -Encoding ASCII
         $oldAgy = $env:MULTIGRAVITY_AGY
         $env:MULTIGRAVITY_AGY = $mockAgy
 
@@ -461,24 +461,24 @@ $user = $env:USERPROFILE
     }
 
     # ---------------------------------------------------------
-    # TEST 13: Invariant Guard on Windows Credential Manager Alteration
+    # TEST 13: Windows Credential Manager Non-Interference Guard
     # ---------------------------------------------------------
-    Run-Test "Windows Credential Manager Tampering Detection and Auto-Restoration" {
+    Run-Test "Windows Credential Manager Non-Interference (Preserve Shared Credentials)" {
         $testProf = "test-prof-tamper"
         Invoke-NewProfile $testProf @() | Out-Null
         Set-DesignatedAccount $testProf "tamper.test@gmail.com"
         Set-Content -Path "$TEST_BASE\$testProf\.auth_vault" -Value '{"token":{"access_token":"valid"},"id_token_email":"tamper.test@gmail.com"}' -Encoding UTF8
 
-        # Mock script that simulates a rogue agy process tampering with Windows Credential Manager
+        # Mock script that simulates an external process updating Windows Credential Manager during isolated execution
         $mockTamperAgy = Join-Path $TEST_BASE "mock_tamper_agy.ps1"
         $mockTamperContent = @"
 . '$MG_SCRIPT'
-Set-GeminiCredential '{"token":{"access_token":"rogue"},"id_token_email":"rogue@gmail.com"}' | Out-Null
+Set-GeminiCredential '{"token":{"access_token":"concurrent_update"},"id_token_email":"concurrent.external@gmail.com"}' | Out-Null
 "@
         Set-Content -Path $mockTamperAgy -Value $mockTamperContent -Encoding UTF8
 
         $mockTamperCmd = Join-Path $TEST_BASE "mock_tamper_agy.cmd"
-        Set-Content -Path $mockTamperCmd -Value "`"$CURRENT_PS`" -NoProfile -File `"$mockTamperAgy`"" -Encoding UTF8
+        Set-Content -Path $mockTamperCmd -Value "`"$CURRENT_PS`" -NoProfile -File `"$mockTamperAgy`"" -Encoding ASCII
 
         $initialCredBeforeTamper = Get-GeminiCredential
 
@@ -489,14 +489,158 @@ Set-GeminiCredential '{"token":{"access_token":"rogue"},"id_token_email":"rogue@
             $out = & "$CURRENT_PS" -NoProfile -File $MG_SCRIPT agy $testProf --isolated version 2>&1 | Out-String
             $credAfterTamper = Get-GeminiCredential
 
-            $c1 = ($out -match "SECURITY INVARIANT VIOLATION")
-            $c2 = ($initialCredBeforeTamper -eq $credAfterTamper)
+            # 1. Isolated session notices update and explicitly reports preserving it
+            $c1 = ($out -match "Shared Windows Credential Manager was updated during isolated session") -and ($out -match "Preserving shared credential")
+            # 2. Isolated session NEVER restored/reverted the shared credential
+            $c2 = ($credAfterTamper -like "*concurrent.external@gmail.com*")
 
-            Assert-Condition ($c1 -and $c2) "Tampering detected and Windows Credential Manager automatically restored" "Tampering recovery failed: c1=$c1, c2=$c2"
+            Assert-Condition ($c1 -and $c2) "External changes to Windows Credential Manager are preserved without restoration or overwrite" "Preservation check failed: c1=$c1, c2=$c2, out=$out"
         } finally {
             $env:MULTIGRAVITY_AGY = $oldAgy
             if ($initialCredBeforeTamper) {
                 Set-GeminiCredential $initialCredBeforeTamper | Out-Null
+            }
+        }
+    }
+
+    # ---------------------------------------------------------
+    # TEST 14: Mixed-Mode Concurrency (Normal CLI + Isolated CLI)
+    # ---------------------------------------------------------
+    Run-Test "Mixed-Mode Concurrency: Normal CLI and Isolated CLI Coexist" {
+        $normProf = "test-prof-normal"
+        $isoProf = "test-prof-isolated"
+
+        Invoke-NewProfile $normProf @() | Out-Null
+        Set-DesignatedAccount $normProf "normal.user@gmail.com"
+        Set-Content -Path "$TEST_BASE\$normProf\.auth_vault" -Value '{"token":{"access_token":"norm_tok"},"id_token_email":"normal.user@gmail.com"}' -Encoding UTF8
+
+        Invoke-NewProfile $isoProf @() | Out-Null
+        Set-DesignatedAccount $isoProf "isolated.user@gmail.com"
+        Set-Content -Path "$TEST_BASE\$isoProf\.auth_vault" -Value '{"token":{"access_token":"iso_tok"},"id_token_email":"isolated.user@gmail.com"}' -Encoding UTF8
+
+        # Mock agy script that delays slightly to ensure true concurrent execution
+        $mockSlowAgy = Join-Path $TEST_BASE "mock_slow_agy.ps1"
+        $mockSlowContent = @"
+Start-Sleep -Milliseconds 600
+Write-Output "mock agy finished"
+"@
+        Set-Content -Path $mockSlowAgy -Value $mockSlowContent -Encoding UTF8
+
+        $mockSlowCmd = Join-Path $TEST_BASE "mock_slow_agy.cmd"
+        Set-Content -Path $mockSlowCmd -Value "`"$CURRENT_PS`" -NoProfile -File `"$mockSlowAgy`"" -Encoding ASCII
+
+        $oldAgy = $env:MULTIGRAVITY_AGY
+        $env:MULTIGRAVITY_AGY = $mockSlowCmd
+
+        # Simulate normal profile being the active session in Windows Credential Manager
+        $normCred = '{"token":{"access_token":"norm_tok"},"id_token_email":"normal.user@gmail.com"}'
+        Set-GeminiCredential $normCred | Out-Null
+
+        try {
+            # Start isolated session in background job
+            $isoJob = Start-Job -ScriptBlock {
+                param($psExe, $mgScript, $prof)
+                & "$psExe" -NoProfile -File $mgScript agy $prof --isolated version 2>&1
+            } -ArgumentList $CURRENT_PS, $MG_SCRIPT, $isoProf
+
+            # While isolated job is running, normal profile executes standard CLI command
+            $normOut = & "$CURRENT_PS" -NoProfile -File $MG_SCRIPT agy $normProf version 2>&1 | Out-String
+
+            # Wait for isolated job
+            $isoJob | Wait-Job | Out-Null
+            $isoOut = ($isoJob | Receive-Job | Out-String)
+            Remove-Job $isoJob -Force
+
+            # Credential Manager must still hold normal.user@gmail.com
+            $credAfter = Get-GeminiCredential
+            $c1 = ($credAfter -like "*normal.user@gmail.com*")
+
+            # Isolated session succeeded with isolated file auth
+            $c2 = ($isoOut -like "*isolated file-based auth*")
+            $c3 = ($normOut -notlike "*isolated file-based auth*")
+
+            Assert-Condition ($c1 -and $c2 -and $c3) "Normal and isolated sessions ran concurrently without cross-contamination" "Mixed concurrency failed: c1=$c1, c2=$c2, c3=$c3"
+        } finally {
+            $env:MULTIGRAVITY_AGY = $oldAgy
+            if ($initialCred) {
+                Set-GeminiCredential $initialCred | Out-Null
+            }
+        }
+    }
+
+    # ---------------------------------------------------------
+    # TEST 15: Same-Profile Concurrent Isolated Instances
+    # ---------------------------------------------------------
+    Run-Test "Same-Profile Concurrent Isolated CLI Instances with Mutex Serialization" {
+        $sameProf = "test-prof-same"
+        Invoke-NewProfile $sameProf @() | Out-Null
+        Set-DesignatedAccount $sameProf "same.account@gmail.com"
+        $initialVault = '{"token":{"access_token":"same_initial","refresh_token":"1//init"},"id_token_email":"same.account@gmail.com"}'
+        Set-Content -Path "$TEST_BASE\$sameProf\.auth_vault" -Value $initialVault -Encoding UTF8
+
+        # Mock agy script that refreshes local token during execution
+        $mockRefreshAgy = Join-Path $TEST_BASE "mock_refresh_agy.ps1"
+        $mockRefreshContent = @"
+param(`$instId)
+Start-Sleep -Milliseconds (Get-Random -Minimum 200 -Maximum 500)
+`$cliDir = "`$env:MULTIGRAVITY_HOME\test-prof-same\.gemini\antigravity-cli"
+if (Test-Path `$cliDir) {
+    `$newToken = [ordered]@{
+        token = [ordered]@{
+            access_token = "ya29.refreshed_`$instId"
+            refresh_token = "1//refreshed_`$instId"
+            expiry = (Get-Date).AddHours(1).ToString("o")
+        }
+        id_token_email = "same.account@gmail.com"
+    } | ConvertTo-Json -Compress
+    Set-Content -Path "`$cliDir\jetski-standalone-oauth-token" -Value `$newToken -Encoding UTF8
+    Set-Content -Path "`$cliDir\antigravity-oauth-token" -Value `$newToken -Encoding UTF8
+}
+Start-Sleep -Milliseconds 200
+"@
+        Set-Content -Path $mockRefreshAgy -Value $mockRefreshContent -Encoding UTF8
+
+        $mockRefreshCmd = Join-Path $TEST_BASE "mock_refresh_agy.cmd"
+        Set-Content -Path $mockRefreshCmd -Value "`"$CURRENT_PS`" -NoProfile -File `"$mockRefreshAgy`" %*" -Encoding ASCII
+
+        $oldAgy = $env:MULTIGRAVITY_AGY
+        $env:MULTIGRAVITY_AGY = $mockRefreshCmd
+
+        try {
+            # Launch two concurrent isolated instances of the same profile
+            $job1 = Start-Job -ScriptBlock {
+                param($psExe, $mgScript, $prof)
+                & "$psExe" -NoProfile -File $mgScript agy $prof --isolated worker1 2>&1
+            } -ArgumentList $CURRENT_PS, $MG_SCRIPT, $sameProf
+
+            $job2 = Start-Job -ScriptBlock {
+                param($psExe, $mgScript, $prof)
+                & "$psExe" -NoProfile -File $mgScript agy $prof --isolated worker2 2>&1
+            } -ArgumentList $CURRENT_PS, $MG_SCRIPT, $sameProf
+
+            $job1 | Wait-Job | Out-Null
+            $job2 | Wait-Job | Out-Null
+            $res1 = ($job1 | Receive-Job | Out-String)
+            $res2 = ($job2 | Receive-Job | Out-String)
+            $state1 = $job1.State
+            $state2 = $job2.State
+            Remove-Job $job1, $job2 -Force
+
+            # Both jobs must execute cleanly
+            $c1 = ($state1 -eq "Completed" -or $res1 -like "*Launching agy CLI*")
+            $c2 = ($state2 -eq "Completed" -or $res2 -like "*Launching agy CLI*")
+
+            # Final vault must be valid JSON and contain a refreshed token from either worker
+            $vaultContent = Get-Content -Raw "$TEST_BASE\$sameProf\.auth_vault" -Encoding UTF8
+            $vaultJson = $vaultContent | ConvertFrom-Json
+            $c3 = ($vaultJson.id_token_email -eq "same.account@gmail.com")
+            $c4 = ($vaultJson.token.access_token -like "ya29.refreshed_*")
+
+            Assert-Condition ($c1 -and $c2 -and $c3 -and $c4) "Concurrent instances of same profile serialized vault sync safely" "Concurrency test failed: c1=$c1, c2=$c2, c3=$c3, c4=$c4, res1=$res1, res2=$res2"
+        } finally {
+            $env:MULTIGRAVITY_AGY = $oldAgy
+            if ($initialCred) {
+                Set-GeminiCredential $initialCred | Out-Null
             }
         }
     }

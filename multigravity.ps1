@@ -1295,13 +1295,14 @@ function Invoke-LaunchAgy {
         if ($isIsolated) {
             Sync-ProfileVaultFromLocalToken $PROFILE
 
-            # Fail-closed credential manager guard: Verify Windows Credential Manager was untouched
+            # Isolated sessions never create, replace, delete, or restore the shared Windows credential.
+            # If the shared credential changed while the isolated session was running (e.g. by another
+            # concurrent session or application), report the observation without modifying it.
             $credAfter = Get-GeminiCredential
-            if ($prevCred -ne $credAfter) {
-                Write-Error "  [auth-guard] SECURITY INVARIANT VIOLATION: Windows Credential Manager was altered during isolated execution! Restoring previous credential."
-                if (![string]::IsNullOrEmpty($prevCred)) {
-                    Set-GeminiCredential $prevCred | Out-Null
-                }
+            if (![string]::IsNullOrEmpty($prevCred) -and ![string]::IsNullOrEmpty($credAfter) -and ($prevCred -ne $credAfter)) {
+                $obsBefore = Get-EmailFromCredential $prevCred
+                $obsAfter = Get-EmailFromCredential $credAfter
+                Write-Host "  [auth-info] Shared Windows Credential Manager was updated during isolated session ($obsBefore -> $obsAfter). Preserving shared credential." -ForegroundColor DarkGray
             }
         } else {
             Save-ProfileVault $PROFILE
