@@ -170,6 +170,23 @@ Antigravity stores Google OAuth authentication tokens in the operating system ke
 - **On exit (`agy`):** Multigravity automatically captures any new or refreshed OAuth token, writes it to the profile's `.auth_vault`, auto-detects your email for `.account`, and restores your previous session.
 - **Check status anytime:** Run `multigravity auth status` or `multigravity status` to see the logged-in email and vault status for every profile.
 
+### Concurrent Isolated CLI Sessions (Opt-In)
+
+By default, launching `multigravity agy <profile>` manages credentials through the OS keyring sequentially. To run **multiple `agy` CLI sessions simultaneously** without cross-profile authentication interference or touching the shared Windows Credential Manager:
+
+```bash
+# Launch with opt-in isolation
+multigravity agy work --isolated
+# or via environment variable
+$env:MULTIGRAVITY_ISOLATED = "1"; multigravity agy work
+```
+
+**How It Works & Safety Invariants:**
+- Uses `agy`'s native file-based token storage (`.gemini/antigravity-cli/antigravity-oauth-token`) by scoping `SSH_CONNECTION` to the child session, bypassing the shared `gemini:antigravity` Windows Credential Manager entry.
+- **Fail-Closed Protection:** Verifies profile identity and binary capability before execution. Refuses to run if credentials mismatch or if the binary lacks file-based authentication support, preventing silent fallback to the shared keyring.
+- **Scoped Environment:** The `SSH_CONNECTION` override is strictly limited to isolated sessions and restored in the caller shell upon exit. Note that subprocesses spawned by `agy` within that session inherit this environment variable.
+
+
 ### Direct `agy <profile>` shell integration
 
 If you'd like to type `agy <profile-name>` directly in your terminal to launch a profile:

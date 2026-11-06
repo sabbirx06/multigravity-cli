@@ -71,6 +71,36 @@ function Find-Agy {
     return $null
 }
 
+function Test-AgyBinarySupportsFileAuth {
+    param([string]$path)
+    if ([string]::IsNullOrEmpty($path) -or !(Test-Path $path)) { return $false }
+    if ($path.EndsWith(".cmd", [System.StringComparison]::OrdinalIgnoreCase) -or 
+        $path.EndsWith(".bat", [System.StringComparison]::OrdinalIgnoreCase) -or
+        $path.EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    try {
+        $fs = [System.IO.File]::OpenRead($path)
+        try {
+            $bufSize = 1048576
+            $buf = New-Object byte[] $bufSize
+            $found1 = $false
+            $found2 = $false
+            while (($bytesRead = $fs.Read($buf, 0, $bufSize)) -gt 0) {
+                $text = [System.Text.Encoding]::ASCII.GetString($buf, 0, $bytesRead)
+                if (!$found1 -and $text.Contains("SSH_CONNECTION")) { $found1 = $true }
+                if (!$found2 -and ($text.Contains("composite_token_storage") -or $text.Contains("shouldBypassKeyring"))) { $found2 = $true }
+                if ($found1 -and $found2) { return $true }
+            }
+            return ($found1 -and $found2)
+        } finally {
+            $fs.Dispose()
+        }
+    } catch {
+        return $false
+    }
+}
+
 $IDE_APP = if ($env:MULTIGRAVITY_IDE) { $env:MULTIGRAVITY_IDE } else { Find-AntigravityIde }
 $APP     = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-AntigravityApp }
 $AGY_APP = if ($env:MULTIGRAVITY_AGY) { $env:MULTIGRAVITY_AGY } else { Find-Agy }
@@ -220,6 +250,9 @@ function Get-EmailFromCredential {
         $data = $credJson | ConvertFrom-Json -ErrorAction SilentlyContinue
         if ($data -and $data.id_token_email) {
             return $data.id_token_email
+        }
+        if ($data -and $data.email) {
+            return $data.email
         }
         if ($data -and $data.id_token) {
             $parts = $data.id_token.Split('.')
@@ -625,6 +658,103 @@ function Save-ProfileVault {
     } | Out-Null
 }
 
+function Sync-ProfileVaultFromLocalToken {
+    param($profileName)
+    $profileDir = "$BASE\$profileName"
+    if (!(Test-Path $profileDir)) { return }
+
+    $cliDir = "$profileDir\.gemini\antigravity-cli"
+    $tokenFile = Join-Path $cliDir "antigravity-oauth-token"
+    if (!(Test-Path $tokenFile)) {
+        $tokenFile = Join-Path $cliDir "jetski-standalone-oauth-token"
+    }
+    if (!(Test-Path $tokenFile)) {
+        Write-Warning "  [auth-guard] No profile-local token file found for '$profileName'. Preserving existing vault."
+        return
+    }
+
+    try {
+        $raw = (Get-Content -Path $tokenFile -Raw -Encoding UTF8).Trim()
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            Write-Warning "  [auth-guard] Profile-local token file for '$profileName' is empty. Preserving existing vault."
+            return
+        }
+
+        $data = $raw | ConvertFrom-Json -ErrorAction Stop
+        if (!$data -or !$data.token) {
+            Write-Warning "  [auth-guard] Profile-local token for '$profileName' is missing token payload. Preserving existing vault."
+            return
+        }
+
+        $email = Get-EmailFromCredential $raw
+        if ([string]::IsNullOrWhiteSpace($email)) {
+            Write-Warning "  [auth-guard] Could not identify account email in local token for '$profileName'. Preserving existing vault."
+            return
+        }
+
+        $expected = Get-DesignatedAccount $profileName
+        if ($expected -like "__CONFLICT__*") {
+            Write-Error "  [auth-guard] IDENTITY CONFLICT DETECTED for profile '$profileName'! Local marker and central registry disagree. Vault sync blocked."
+            return
+        }
+        if (![string]::IsNullOrEmpty($expected)) {
+            if ($email.Trim().ToLowerInvariant() -ne $expected.Trim().ToLowerInvariant()) {
+                Write-Error "  [auth-guard] IDENTITY MISMATCH in local token for '$profileName'! Token belongs to '$email' but profile designated for '$expected'. Preserving vault."
+                return
+            }
+        }
+
+        Invoke-WithProfileVaultLock $profileName {
+            Reconcile-ProfileVault $profileName
+
+            $txnDir = "$profileDir\.auth_txn_backup"
+            if (Test-Path $txnDir) { Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Path $txnDir -Force | Out-Null
+
+            $trackedFiles = @(
+                ".auth_vault",
+                ".account"
+            )
+
+            $manifest = [ordered]@{
+                profile   = $profileName
+                timestamp = (Get-Date).ToString("o")
+                source    = "local-token-sync"
+                tracked   = [ordered]@{}
+            }
+
+            foreach ($rel in $trackedFiles) {
+                $src = Join-Path $profileDir $rel
+                $dst = Join-Path $txnDir ($rel -replace '[\\/]', '__')
+                if (Test-Path $src) {
+                    Copy-Item $src -Destination $dst -Force
+                    $manifest.tracked[$rel] = "present"
+                } else {
+                    $manifest.tracked[$rel] = "absent"
+                }
+            }
+
+            Write-AtomicFile (Join-Path $txnDir "manifest.json") ($manifest | ConvertTo-Json -Depth 5)
+            Write-AtomicFile (Join-Path $txnDir ".txn_ready") "READY"
+
+            try {
+                Write-AtomicFile "$profileDir\.auth_vault" $raw
+                Write-AtomicFile "$profileDir\.account" $email
+                if (Test-Path $txnDir) {
+                    Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Write-Host "  [auth] Synchronized refreshed token to profile vault for '$profileName' ($email)" -ForegroundColor Green
+            } catch {
+                Rollback-ProfileVault $profileName
+                if (Test-Path $txnDir) { Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue }
+                Write-Error "  [auth-guard] Failed synchronizing local token to vault for '$profileName': $_"
+            }
+        } | Out-Null
+    } catch {
+        Write-Error "  [auth-guard] Failed reading local token file for '$profileName': $_"
+    }
+}
+
 function Prepare-ProfileVault {
     param($profileName)
     $profileDir = "$BASE\$profileName"
@@ -878,8 +1008,9 @@ function Write-Usage {
     Write-Host "  completion                  Show setup instructions for shell completion"
     Write-Host "  <name> [args]               Launch Antigravity IDE (VS Code-like) with profile (Default)"
     Write-Host "  <name> --app [args]         Launch Antigravity 2.0 app with profile"
-    Write-Host "  agy <name> [args]           Launch agy CLI in terminal with profile"
-    Write-Host "  <name> --cli [args]         Launch agy CLI in terminal with profile"
+    Write-Host "  agy <name> [--isolated] [args] Launch agy CLI in terminal with profile"
+    Write-Host "  <name> --cli [--isolated] [args] Launch agy CLI in terminal with profile (opt-in --isolated for concurrent file-based auth)"
+    Write-Host "                              Note: --isolated scopes SSH_CONNECTION to the session; child processes inherit it."
     Write-Host "  help                        Show this help"
     Write-Host ""
     Write-Host "Profile names: alphanumeric and hyphens only (e.g. work, personal, test-1)"
@@ -1059,13 +1190,34 @@ function Invoke-LaunchAgy {
         exit 1
     }
 
-    Write-Host "Launching agy CLI with profile '$PROFILE'..."
+    # Detect opt-in isolated mode (CLI flag or environment variable)
+    $isIsolated = $false
+    $filteredForwardArgs = @()
+    if ($ArgsToForward) {
+        foreach ($arg in $ArgsToForward) {
+            if ($arg -eq "--isolated" -or $arg -eq "--file-auth" -or $arg -eq "-isolated") {
+                $isIsolated = $true
+            } else {
+                $filteredForwardArgs += $arg
+            }
+        }
+    }
+    if ($env:MULTIGRAVITY_ISOLATED -eq "1" -or $env:MULTIGRAVITY_AUTH_MODE -eq "isolated") {
+        $isIsolated = $true
+    }
+
+    if ($isIsolated) {
+        Write-Host "Launching agy CLI with profile '$PROFILE' (isolated file-based auth)..." -ForegroundColor Cyan
+    } else {
+        Write-Host "Launching agy CLI with profile '$PROFILE'..."
+    }
     Write-Host "Tip: To sign into a different Google account for this profile, type '/logout' then '/login' inside agy." -ForegroundColor DarkCyan
 
     $prevUserProfile = $env:USERPROFILE
     $prevAppData = $env:APPDATA
     $prevLocalAppData = $env:LOCALAPPDATA
     $prevAgyAccount = $env:AGY_ACCOUNT
+    $prevSsh = $env:SSH_CONNECTION
     $prevCred = Get-GeminiCredential
 
     $accountFile = "$PROFILE_DIR\.account"
@@ -1080,26 +1232,94 @@ function Invoke-LaunchAgy {
     $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
     $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
 
-    Prepare-ProfileVault $PROFILE
+    if ($isIsolated) {
+        # 1. Fail-closed: Verify agy binary supports file-based authentication mechanism
+        if (!(Test-AgyBinarySupportsFileAuth $agyExec)) {
+            Write-Error "Error: Installed agy binary at '$agyExec' does not support isolated file-based authentication. Aborting to prevent silent fallback to Windows Credential Manager."
+            exit 1
+        }
+
+        # 2. Fail-closed: Authoritative designated account validation
+        $expected = Get-DesignatedAccount $PROFILE
+        if ([string]::IsNullOrEmpty($expected)) {
+            Write-Error "Error: Profile '$PROFILE' has no designated account configured. Isolated mode requires an authoritative designated account to prevent cross-profile contamination. Run: multigravity auth bind $PROFILE <email>"
+            exit 1
+        }
+        if ($expected -like "__CONFLICT__*") {
+            Write-Error "Error: Profile '$PROFILE' has conflicting designated identities between local marker and central registry. Vault sync blocked."
+            exit 1
+        }
+
+        # 3. Fail-closed: Verify vault exists and matches designated account
+        $vaultFile = "$PROFILE_DIR\.auth_vault"
+        if (!(Test-Path $vaultFile)) {
+            Write-Error "Error: Profile '$PROFILE' has no saved session in its vault (.auth_vault). Isolated mode requires an existing verified session. Run: multigravity auth save $PROFILE"
+            exit 1
+        }
+        $vaultVal = (Get-Content -Path $vaultFile -Raw -Encoding UTF8).Trim()
+        if ([string]::IsNullOrEmpty($vaultVal)) {
+            Write-Error "Error: Profile '$PROFILE' vault is empty. Run: multigravity auth save $PROFILE"
+            exit 1
+        }
+        $vaultEmail = Get-EmailFromCredential $vaultVal
+        if ([string]::IsNullOrEmpty($vaultEmail) -or ($vaultEmail.Trim().ToLowerInvariant() -ne $expected.Trim().ToLowerInvariant())) {
+            Write-Error "Error: Profile '$PROFILE' vault credentials belong to '$vaultEmail', but profile is designated for '$expected'. Aborting isolated launch."
+            exit 1
+        }
+
+        # 4. Seed verified token files
+        $cliDir = "$PROFILE_DIR\.gemini\antigravity-cli"
+        if (!(Test-Path $cliDir)) {
+            New-Item -ItemType Directory -Path $cliDir -Force | Out-Null
+        }
+        $t1 = Join-Path $cliDir "antigravity-oauth-token"
+        $t2 = Join-Path $cliDir "jetski-standalone-oauth-token"
+        Write-AtomicFile $t1 $vaultVal
+        Write-AtomicFile $t2 $vaultVal
+
+        # 5. Scope SSH environment override strictly to this isolated session
+        $env:SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 0"
+    } else {
+        Prepare-ProfileVault $PROFILE
+    }
 
     try {
-        if ($ArgsToForward -and $ArgsToForward.Count -gt 0) {
-            & $agyExec @ArgsToForward
+        if ($filteredForwardArgs -and $filteredForwardArgs.Count -gt 0) {
+            & $agyExec @filteredForwardArgs
         }
         else {
             & $agyExec
         }
     }
     finally {
-        Save-ProfileVault $PROFILE
+        if ($isIsolated) {
+            Sync-ProfileVaultFromLocalToken $PROFILE
 
-        if (![string]::IsNullOrEmpty($prevCred)) {
-            Set-GeminiCredential $prevCred | Out-Null
-        } elseif (Test-Path "$BASE\.system_auth_vault") {
-            $sys = (Get-Content -Path "$BASE\.system_auth_vault" -Raw -Encoding UTF8).Trim()
-            if (![string]::IsNullOrEmpty($sys)) {
-                Set-GeminiCredential $sys | Out-Null
+            # Fail-closed credential manager guard: Verify Windows Credential Manager was untouched
+            $credAfter = Get-GeminiCredential
+            if ($prevCred -ne $credAfter) {
+                Write-Error "  [auth-guard] SECURITY INVARIANT VIOLATION: Windows Credential Manager was altered during isolated execution! Restoring previous credential."
+                if (![string]::IsNullOrEmpty($prevCred)) {
+                    Set-GeminiCredential $prevCred | Out-Null
+                }
             }
+        } else {
+            Save-ProfileVault $PROFILE
+
+            if (![string]::IsNullOrEmpty($prevCred)) {
+                Set-GeminiCredential $prevCred | Out-Null
+            } elseif (Test-Path "$BASE\.system_auth_vault") {
+                $sys = (Get-Content -Path "$BASE\.system_auth_vault" -Raw -Encoding UTF8).Trim()
+                if (![string]::IsNullOrEmpty($sys)) {
+                    Set-GeminiCredential $sys | Out-Null
+                }
+            }
+        }
+
+        if ($null -ne $prevSsh) {
+            $env:SSH_CONNECTION = $prevSsh
+        } else {
+            Remove-Item Env:\SSH_CONNECTION -ErrorAction SilentlyContinue
         }
 
         $env:USERPROFILE = $prevUserProfile
