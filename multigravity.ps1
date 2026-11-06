@@ -237,46 +237,398 @@ function Get-EmailFromCredential {
     return $null
 }
 
-function Save-ProfileVault {
+function Get-DesignatedAccount {
     param($profileName)
     $profileDir = "$BASE\$profileName"
-    if (!(Test-Path $profileDir)) { return }
-    $current = Get-GeminiCredential
-    if (![string]::IsNullOrEmpty($current)) {
-        Set-Content -Path "$profileDir\.auth_vault" -Value $current -NoNewline -Encoding UTF8 -Force
-        $email = Get-EmailFromCredential $current
-        if (![string]::IsNullOrEmpty($email)) {
-            Set-Content -Path "$profileDir\.account" -Value $email -NoNewline -Encoding UTF8 -Force
-            Write-Host "  [auth] Saved session for profile '$profileName' ($email)" -ForegroundColor Green
-        } else {
-            Write-Host "  [auth] Saved session for profile '$profileName'" -ForegroundColor Green
-        }
-        $cliDir = "$profileDir\.gemini\antigravity-cli"
-        if (Test-Path $cliDir) {
-            Set-Content -Path "$cliDir\jetski-standalone-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
-            Set-Content -Path "$cliDir\antigravity-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
-        }
-    } else {
-        if (Test-Path "$profileDir\.auth_vault") {
-            Remove-Item "$profileDir\.auth_vault" -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path "$profileDir\.account") {
-            Remove-Item "$profileDir\.account" -Force -ErrorAction SilentlyContinue
-        }
-        $cliDir = "$profileDir\.gemini\antigravity-cli"
-        if (Test-Path "$cliDir\jetski-standalone-oauth-token") {
-            Remove-Item "$cliDir\jetski-standalone-oauth-token" -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path "$cliDir\antigravity-oauth-token") {
-            Remove-Item "$cliDir\antigravity-oauth-token" -Force -ErrorAction SilentlyContinue
-        }
-        Write-Host "  [auth] Session cleared for profile '$profileName'" -ForegroundColor DarkYellow
+
+    $markerVal = $null
+    $marker = "$profileDir\.designated_account"
+    if (Test-Path $marker) {
+        $val = (Get-Content -Path $marker -Raw -Encoding UTF8).Trim()
+        if (![string]::IsNullOrEmpty($val)) { $markerVal = $val }
     }
+
+    $centralVal = $null
+    $centralMap = "$BASE\.profile_mappings.json"
+    if (Test-Path $centralMap) {
+        try {
+            $map = Get-Content -Path $centralMap -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($map -and $map.PSObject.Properties[$profileName]) {
+                $val = [string]($map.$profileName).Trim()
+                if (![string]::IsNullOrEmpty($val)) { $centralVal = $val }
+            }
+        } catch {}
+    }
+
+    # Conflict detection between local marker and central registry
+    if (![string]::IsNullOrEmpty($markerVal) -and ![string]::IsNullOrEmpty($centralVal)) {
+        if ($markerVal.Trim().ToLowerInvariant() -ne $centralVal.Trim().ToLowerInvariant()) {
+            return "__CONFLICT__|$markerVal|$centralVal"
+        }
+        return $markerVal
+    }
+
+    if (![string]::IsNullOrEmpty($markerVal)) {
+        return $markerVal
+    }
+
+    if (![string]::IsNullOrEmpty($centralVal)) {
+        return $centralVal
+    }
+
+    return $null
+}
+
+function Find-ProfileByDesignatedAccount {
+    param($email)
+    if ([string]::IsNullOrWhiteSpace($email)) { return $null }
+    $clean = $email.Trim().ToLowerInvariant()
+
+    if (Test-Path $BASE) {
+        $profiles = Get-ChildItem -Directory -Path $BASE | Where-Object { $_.PSIsContainer -and $_.Name -ne ".templates" }
+        foreach ($p in $profiles) {
+            $des = Get-DesignatedAccount $p.Name
+            if ($des -and $des -notlike "__CONFLICT__:*") {
+                if ($des.Trim().ToLowerInvariant() -eq $clean) {
+                    return $p.Name
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Invoke-WithRegistryLock {
+    param([scriptblock]$action)
+    $mutexName = "Local\multigravity_central_registry_lock"
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $hasLock = $false
+    try {
+        try {
+            $hasLock = $mutex.WaitOne(10000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $hasLock = $true
+        }
+        if (!$hasLock) {
+            Write-Error "  [auth-guard] Could not acquire central registry lock (timed out after 10s)."
+            return $null
+        }
+        & $action
+    } finally {
+        if ($hasLock) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        $mutex.Dispose()
+    }
+}
+
+function Set-DesignatedAccount {
+    param($profileName, $email)
+    if ([string]::IsNullOrWhiteSpace($profileName) -or [string]::IsNullOrWhiteSpace($email)) { return }
+    $profileDir = "$BASE\$profileName"
+    if (Test-Path $profileDir) {
+        Write-AtomicFile "$profileDir\.designated_account" $email
+    }
+    Invoke-WithRegistryLock {
+        $centralMap = "$BASE\.profile_mappings.json"
+        $map = [ordered]@{}
+        if (Test-Path $centralMap) {
+            try {
+                $loaded = Get-Content -Path $centralMap -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($loaded) {
+                    foreach ($prop in $loaded.PSObject.Properties) {
+                        $map[$prop.Name] = $prop.Value
+                    }
+                }
+            } catch {}
+        }
+        $map[$profileName] = $email
+        $json = $map | ConvertTo-Json -Depth 5
+        Write-AtomicFile $centralMap $json
+    }
+}
+
+function Remove-DesignatedAccount {
+    param($profileName)
+    if ([string]::IsNullOrWhiteSpace($profileName)) { return }
+    $profileDir = "$BASE\$profileName"
+    if (Test-Path "$profileDir\.designated_account") {
+        Remove-Item "$profileDir\.designated_account" -Force -ErrorAction SilentlyContinue
+    }
+    Invoke-WithRegistryLock {
+        $centralMap = "$BASE\.profile_mappings.json"
+        if (Test-Path $centralMap) {
+            try {
+                $loaded = Get-Content -Path $centralMap -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($loaded -and $loaded.PSObject.Properties[$profileName]) {
+                    $newMap = [ordered]@{}
+                    foreach ($prop in $loaded.PSObject.Properties) {
+                        if ($prop.Name -ne $profileName) {
+                            $newMap[$prop.Name] = $prop.Value
+                        }
+                    }
+                    $json = $newMap | ConvertTo-Json -Depth 5
+                    Write-AtomicFile $centralMap $json
+                }
+            } catch {}
+        }
+    }
+}
+
+function Write-AtomicFile {
+    param(
+        [string]$targetPath,
+        [string]$content
+    )
+    $fullTarget = [System.IO.Path]::GetFullPath($targetPath)
+    $dir = [System.IO.Path]::GetDirectoryName($fullTarget)
+    if (!(Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $guid = [System.Guid]::NewGuid().ToString("N")
+    $fileName = [System.IO.Path]::GetFileName($fullTarget)
+    $tempFile = Join-Path $dir (".tmp_" + $fileName + "_" + $guid)
+    $bakFile  = Join-Path $dir (".bak_" + $fileName + "_" + $guid)
+
+    try {
+        [System.IO.File]::WriteAllText($tempFile, $content, [System.Text.Encoding]::UTF8)
+        if ([System.IO.File]::Exists($fullTarget)) {
+            # Win32 ReplaceFile replaces target with tempFile atomically
+            [System.IO.File]::Replace($tempFile, $fullTarget, $bakFile)
+            if ([System.IO.File]::Exists($bakFile) -and [System.IO.File]::Exists($fullTarget)) {
+                try { [System.IO.File]::Delete($bakFile) } catch {}
+            }
+        } else {
+            [System.IO.File]::Move($tempFile, $fullTarget)
+        }
+    } catch {
+        $writeErr = $_
+        # Non-destructive recovery: If ReplaceFile moved target to bakFile but replacement failed
+        if (![System.IO.File]::Exists($fullTarget) -and [System.IO.File]::Exists($bakFile)) {
+            try {
+                [System.IO.File]::Move($bakFile, $fullTarget)
+            } catch {
+                $restoreErr = $_
+                Write-Error "  [auth-guard] CRITICAL: Target '$fullTarget' failed replacement AND restoration failed: $restoreErr. Recovery backup PRESERVED at '$bakFile'."
+                throw $restoreErr
+            }
+        }
+        throw $writeErr
+    } finally {
+        if ([System.IO.File]::Exists($tempFile)) {
+            try { [System.IO.File]::Delete($tempFile) } catch {}
+        }
+        # PRESERVE BACKUP INVARIANT: Never delete bakFile if targetPath does not exist!
+        if ([System.IO.File]::Exists($bakFile)) {
+            if ([System.IO.File]::Exists($fullTarget)) {
+                try { [System.IO.File]::Delete($bakFile) } catch {}
+            } else {
+                Write-Warning "  [auth-guard] Target '$fullTarget' is missing! Preserving recovery backup at '$bakFile'."
+            }
+        }
+    }
+}
+
+function Rollback-ProfileVault {
+    param($profileName)
+    $profileDir = "$BASE\$profileName"
+    $txnDir = "$profileDir\.auth_txn_backup"
+    if (!(Test-Path $txnDir)) { return }
+
+    $readyMarker = Join-Path $txnDir ".txn_ready"
+    $manifestFile = Join-Path $txnDir "manifest.json"
+
+    # Incomplete snapshot protection: If the snapshot was not fully completed before interruption,
+    # live credentials were NEVER modified because live updates only begin AFTER .txn_ready is written.
+    if (!(Test-Path $readyMarker) -or !(Test-Path $manifestFile)) {
+        Write-Warning "  [auth-guard] Incomplete transaction snapshot detected for profile '$profileName'. Live credentials were untouched. Discarding incomplete snapshot."
+        Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    try {
+        $manifest = Get-Content $manifestFile -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        if ($manifest -and $manifest.tracked) {
+            foreach ($prop in $manifest.tracked.PSObject.Properties) {
+                $rel = $prop.Name
+                $state = $prop.Value
+                $backupFile = Join-Path $txnDir ($rel -replace '[\\/]', '__')
+                $liveFile = Join-Path $profileDir $rel
+                $liveDir = Split-Path -Parent $liveFile
+
+                if ($state -eq "present") {
+                    if (Test-Path $backupFile) {
+                        if (!(Test-Path $liveDir)) { New-Item -ItemType Directory -Path $liveDir -Force | Out-Null }
+                        Copy-Item $backupFile -Destination $liveFile -Force
+                    } else {
+                        Write-Error "  [auth-guard] Missing backup file for '$rel'! Preserving existing live file to prevent data loss."
+                    }
+                } elseif ($state -eq "absent") {
+                    # Only remove live file if the verified manifest explicitly proves it was absent when transaction began
+                    if (Test-Path $liveFile) {
+                        Remove-Item $liveFile -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Error "  [auth-guard] Failed parsing transaction manifest for '$profileName': $_. Preserving live credentials."
+    }
+}
+
+function Reconcile-ProfileVault {
+    param($profileName)
+    $profileDir = "$BASE\$profileName"
+    $txnDir = "$profileDir\.auth_txn_backup"
+    if (!(Test-Path $txnDir)) { return }
+
+    Write-Warning "  [auth-guard] Detected interrupted save for profile '$profileName'. Reconciling vault to verified baseline..."
+    Rollback-ProfileVault $profileName
+    if (Test-Path $txnDir) {
+        Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-WithProfileVaultLock {
+    param(
+        [string]$profileName,
+        [scriptblock]$action
+    )
+    $cleanName = ($profileName -replace '[^a-zA-Z0-9_]', '_')
+    $mutexName = "Local\multigravity_vault_$cleanName"
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $hasLock = $false
+    try {
+        try {
+            $hasLock = $mutex.WaitOne(5000)
+        } catch [System.Threading.AbandonedMutexException] {
+            $hasLock = $true
+        }
+        if (!$hasLock) {
+            Write-Error "  [auth-guard] Could not acquire vault lock for profile '$profileName' (timed out after 5s)."
+            return $false
+        }
+        & $action
+        return $true
+    } finally {
+        if ($hasLock) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        $mutex.Dispose()
+    }
+}
+
+function Save-ProfileVault {
+    param($profileName, [switch]$Force)
+    $profileDir = "$BASE\$profileName"
+    if (!(Test-Path $profileDir)) { return }
+
+    Invoke-WithProfileVaultLock $profileName {
+        Reconcile-ProfileVault $profileName
+
+        $current = Get-GeminiCredential
+        if ([string]::IsNullOrEmpty($current)) {
+            Write-Warning "  [auth-guard] Windows Credential Manager has no active Antigravity session. Preserving existing vault for '$profileName'."
+            return
+        }
+
+        $email = Get-EmailFromCredential $current
+        if ([string]::IsNullOrEmpty($email)) {
+            Write-Warning "  [auth-guard] Active credential in Windows Credential Manager is malformed or unidentifiable. Preserving existing vault for '$profileName'."
+            return
+        }
+
+        $expected = Get-DesignatedAccount $profileName
+        if ($expected -like "__CONFLICT__*") {
+            $parts = $expected.Split("|")
+            $mVal = $parts[1]
+            $cVal = $parts[2]
+            if (!$Force) {
+                Write-Error "  [auth-guard] IDENTITY CONFLICT DETECTED for profile '$profileName'! Local marker specifies '$mVal' but central registry specifies '$cVal'. Credential write-back is BLOCKED to prevent corruption. Resolve the conflict explicitly using 'multigravity auth bind $profileName <email>' or 'multigravity auth save $profileName --force'."
+                return
+            }
+            $expected = $email
+        } elseif ($Force) {
+            $expected = $email
+        } elseif (![string]::IsNullOrEmpty($expected)) {
+            if ($email.Trim().ToLowerInvariant() -ne $expected.Trim().ToLowerInvariant()) {
+                Write-Error "  [auth-guard] IDENTITY MISMATCH DETECTED! Active credential belongs to '$email', but profile '$profileName' is designated for '$expected'. Overwrite rejected to prevent cross-profile contamination. Use 'multigravity auth bind $profileName <email>' or 'multigravity auth save $profileName --force' to intentionally switch accounts."
+                return
+            }
+        } else {
+            # Profile has no designated account yet (e.g. newly created or imported profile)
+            # Guard against accidental binding to another profile's global credential
+            $ownerProfile = Find-ProfileByDesignatedAccount $email
+            if ($ownerProfile -and $ownerProfile -ne $profileName) {
+                Write-Error "  [auth-guard] CROSS-PROFILE BINDING BLOCKED! Active credential belongs to '$email', which is already designated to profile '$ownerProfile'. Profile '$profileName' will not be bound to this account automatically. To intentionally link this profile, use 'multigravity auth bind $profileName $email' or 'multigravity auth save $profileName --force'."
+                return
+            }
+            $expected = $email
+        }
+
+        # Stage transaction backup with integrity manifest and ready marker
+        $txnDir = "$profileDir\.auth_txn_backup"
+        if (Test-Path $txnDir) { Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Path $txnDir -Force | Out-Null
+
+        $trackedFiles = @(
+            ".auth_vault",
+            ".account",
+            ".designated_account",
+            ".gemini\antigravity-cli\jetski-standalone-oauth-token",
+            ".gemini\antigravity-cli\antigravity-oauth-token"
+        )
+
+        $manifest = [ordered]@{
+            profile   = $profileName
+            timestamp = (Get-Date).ToString("o")
+            tracked   = [ordered]@{}
+        }
+
+        foreach ($rel in $trackedFiles) {
+            $src = Join-Path $profileDir $rel
+            $dst = Join-Path $txnDir ($rel -replace '[\\/]', '__')
+            if (Test-Path $src) {
+                Copy-Item $src -Destination $dst -Force
+                $manifest.tracked[$rel] = "present"
+            } else {
+                $manifest.tracked[$rel] = "absent"
+            }
+        }
+        $manifestJson = $manifest | ConvertTo-Json -Depth 5
+        Write-AtomicFile (Join-Path $txnDir "manifest.json") $manifestJson
+        Write-AtomicFile (Join-Path $txnDir ".txn_ready") "READY"
+
+        try {
+            Write-AtomicFile "$profileDir\.auth_vault" $current
+            Write-AtomicFile "$profileDir\.account" $email
+            Write-AtomicFile "$profileDir\.designated_account" $expected
+
+            $cliDir = "$profileDir\.gemini\antigravity-cli"
+            if (Test-Path $cliDir) {
+                Write-AtomicFile "$cliDir\jetski-standalone-oauth-token" $current
+                Write-AtomicFile "$cliDir\antigravity-oauth-token" $current
+            }
+            Set-DesignatedAccount $profileName $expected
+
+            # Transaction completed cleanly: discard staging backup
+            if (Test-Path $txnDir) {
+                Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "  [auth] Verified and saved session for profile '$profileName' ($email)" -ForegroundColor Green
+        } catch {
+            Rollback-ProfileVault $profileName
+            if (Test-Path $txnDir) { Remove-Item $txnDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Write-Error "  [auth-guard] Critical error: failed writing vault files for '$profileName'. Rolled back to previous verified state. Details: $_"
+            throw $_
+        }
+    } | Out-Null
 }
 
 function Prepare-ProfileVault {
     param($profileName)
     $profileDir = "$BASE\$profileName"
+    Reconcile-ProfileVault $profileName
     $vaultFile = "$profileDir\.auth_vault"
     $sysVaultFile = "$BASE\.system_auth_vault"
 
@@ -307,11 +659,28 @@ function Prepare-ProfileVault {
 }
 
 function Invoke-AuthCmd {
-    param($sub, $name)
+    param(
+        [string]$sub,
+        $argA,
+        $argB
+    )
+    $tokens = @()
+    if ($argA -is [System.Array]) {
+        $tokens += $argA
+    } elseif ($argA) {
+        $tokens += $argA
+    }
+    if ($argB -is [System.Array]) {
+        $tokens += $argB
+    } elseif ($argB) {
+        $tokens += $argB
+    }
+
     switch ($sub) {
         "save" {
+            $name = ($tokens | Where-Object { $_ -notlike "-*" } | Select-Object -First 1)
             if ([string]::IsNullOrWhiteSpace($name)) {
-                Write-Error "Error: profile name required. Usage: multigravity auth save <profile>"
+                Write-Error "Error: profile name required. Usage: multigravity auth save <profile> [--force]"
                 exit 1
             }
             Validate-Name $name
@@ -320,26 +689,28 @@ function Invoke-AuthCmd {
                 Write-Error "Error: profile '$name' does not exist"
                 exit 1
             }
-            $current = Get-GeminiCredential
-            if ([string]::IsNullOrEmpty($current)) {
-                Write-Host "No active Antigravity session found in Credential Manager." -ForegroundColor Yellow
-                return
+            $force = ($tokens -contains "--force" -or $tokens -contains "-f")
+            Save-ProfileVault $name -Force:$force
+        }
+        "bind" {
+            $nonFlags = @($tokens | Where-Object { $_ -notlike "-*" })
+            $name  = if ($nonFlags.Count -gt 0) { $nonFlags[0] } else { $null }
+            $email = if ($nonFlags.Count -gt 1) { $nonFlags[1] } else { $null }
+            if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($email)) {
+                Write-Error "Error: profile name and email required. Usage: multigravity auth bind <profile> <email>"
+                exit 1
             }
-            Set-Content -Path "$profileDir\.auth_vault" -Value $current -NoNewline -Encoding UTF8 -Force
-            $email = Get-EmailFromCredential $current
-            if (![string]::IsNullOrEmpty($email)) {
-                Set-Content -Path "$profileDir\.account" -Value $email -NoNewline -Encoding UTF8 -Force
-                Write-Host "Saved active authentication session to profile '$name' ($email)" -ForegroundColor Green
-            } else {
-                Write-Host "Saved active authentication session to profile '$name'" -ForegroundColor Green
+            Validate-Name $name
+            $profileDir = "$BASE\$name"
+            if (!(Test-Path $profileDir)) {
+                Write-Error "Error: profile '$name' does not exist"
+                exit 1
             }
-            $cliDir = "$profileDir\.gemini\antigravity-cli"
-            if (Test-Path $cliDir) {
-                Set-Content -Path "$cliDir\jetski-standalone-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
-                Set-Content -Path "$cliDir\antigravity-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
-            }
+            Set-DesignatedAccount $name $email
+            Write-Host "Bound profile '$name' to designated account '$email'" -ForegroundColor Green
         }
         "load" {
+            $name = ($tokens | Where-Object { $_ -notlike "-*" } | Select-Object -First 1)
             if ([string]::IsNullOrWhiteSpace($name)) {
                 Write-Error "Error: profile name required. Usage: multigravity auth load <profile>"
                 exit 1
@@ -377,13 +748,35 @@ function Invoke-AuthCmd {
                 Write-Host "Currently Active System Session: (none / logged out)" -ForegroundColor DarkGray
             }
             Write-Host ""
-            Write-Host ("{0,-20} {1,-30} {2}" -f "PROFILE", "VAULT ACCOUNT", "STATUS")
-            Write-Host ("{0,-20} {1,-30} {2}" -f "-------", "-------------", "------")
+            Write-Host ("{0,-15} {1,-34} {2,-34} {3}" -f "PROFILE", "DESIGNATED ACCOUNT", "VAULT ACCOUNT", "STATUS")
+            Write-Host ("{0,-15} {1,-34} {2,-34} {3}" -f "-------", "------------------", "-------------", "------")
             if (Test-Path $BASE) {
                 $profiles = Get-ChildItem -Directory -Path $BASE | Where-Object { $_.PSIsContainer -and $_.Name -ne ".templates" }
                 foreach ($p in $profiles) {
                     $vaultFile = Join-Path $p.FullName ".auth_vault"
                     $accountFile = Join-Path $p.FullName ".account"
+                    $designated = Get-DesignatedAccount $p.Name
+
+                    # Check for conflict between local marker and central registry
+                    $localMarker = Join-Path $p.FullName ".designated_account"
+                    $locVal = if (Test-Path $localMarker) { (Get-Content $localMarker -Raw).Trim() } else { $null }
+                    $cenVal = $null
+                    if (Test-Path "$BASE\.profile_mappings.json") {
+                        try {
+                            $m = Get-Content "$BASE\.profile_mappings.json" -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+                            if ($m -and $m.PSObject.Properties[$p.Name]) { $cenVal = [string]($m.$($p.Name)).Trim() }
+                        } catch {}
+                    }
+                    $isConflict = (![string]::IsNullOrEmpty($locVal) -and ![string]::IsNullOrEmpty($cenVal) -and $locVal.ToLowerInvariant() -ne $cenVal.ToLowerInvariant())
+
+                    if ($designated -like "__CONFLICT__*") {
+                        $parts = $designated.Split("|")
+                        $designated = "$($parts[1]) (conflict)"
+                        $isConflict = $true
+                    } elseif ([string]::IsNullOrEmpty($designated)) {
+                        $designated = "-"
+                    }
+
                     $email = "-"
                     if (Test-Path $accountFile) {
                         $email = (Get-Content $accountFile -Raw).Trim()
@@ -393,18 +786,47 @@ function Invoke-AuthCmd {
                         if ($parsed) { $email = $parsed }
                     }
                     $status = if (Test-Path $vaultFile) { "saved" } else { "empty" }
-                    if ($email -ne "-" -and $email -eq $activeEmail) {
-                        Write-Host ("{0,-20} {1,-30} " -f $p.Name, $email) -NoNewline
-                        Write-Host "active" -ForegroundColor Green
+
+                    $mismatch = ($designated -ne "-" -and $email -ne "-" -and $designated.Trim().ToLowerInvariant() -ne $email.Trim().ToLowerInvariant())
+                    if ($isConflict) {
+                        $status = "CONFLICT!"
+                    } elseif ($mismatch) {
+                        $status = "MISMATCH!"
+                    } elseif ($email -ne "-" -and $email -eq $activeEmail) {
+                        $status = "active"
+                    }
+
+                    if ($isConflict -or $mismatch) {
+                        Write-Host ("{0,-15} {1,-34} {2,-34} " -f $p.Name, $designated, $email) -NoNewline
+                        Write-Host $status -ForegroundColor Red
+                    } elseif ($status -eq "active") {
+                        Write-Host ("{0,-15} {1,-34} {2,-34} " -f $p.Name, $designated, $email) -NoNewline
+                        Write-Host $status -ForegroundColor Green
                     } else {
-                        Write-Host ("{0,-20} {1,-30} {2}" -f $p.Name, $email, $status)
+                        Write-Host ("{0,-15} {1,-34} {2,-34} {3}" -f $p.Name, $designated, $email, $status)
                     }
                 }
             }
         }
-        "clear" {
+        "unbind" {
+            $name = ($tokens | Where-Object { $_ -notlike "-*" } | Select-Object -First 1)
             if ([string]::IsNullOrWhiteSpace($name)) {
-                Write-Error "Error: profile name required. Usage: multigravity auth clear <profile>"
+                Write-Error "Error: profile name required. Usage: multigravity auth unbind <profile>"
+                exit 1
+            }
+            Validate-Name $name
+            $profileDir = "$BASE\$name"
+            if (!(Test-Path $profileDir)) {
+                Write-Error "Error: profile '$name' does not exist"
+                exit 1
+            }
+            Remove-DesignatedAccount $name
+            Write-Host "Removed designated account binding for profile '$name'" -ForegroundColor Yellow
+        }
+        "clear" {
+            $name = ($tokens | Where-Object { $_ -notlike "-*" } | Select-Object -First 1)
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                Write-Error "Error: profile name required. Usage: multigravity auth clear <profile> [--unbind]"
                 exit 1
             }
             Validate-Name $name
@@ -414,10 +836,15 @@ function Invoke-AuthCmd {
             $cliDir = "$profileDir\.gemini\antigravity-cli"
             if (Test-Path "$cliDir\jetski-standalone-oauth-token") { Remove-Item "$cliDir\jetski-standalone-oauth-token" -Force -ErrorAction SilentlyContinue }
             if (Test-Path "$cliDir\antigravity-oauth-token") { Remove-Item "$cliDir\antigravity-oauth-token" -Force -ErrorAction SilentlyContinue }
-            Write-Host "Cleared saved session for profile '$name'"
+            if ($tokens -contains "--unbind" -or $tokens -contains "-u") {
+                Remove-DesignatedAccount $name
+                Write-Host "Cleared saved session and unlinked designated account for profile '$name'"
+            } else {
+                Write-Host "Cleared saved session for profile '$name' (designated account binding preserved)"
+            }
         }
         default {
-            Write-Host "Usage: multigravity auth <save|load|status|clear> [profile]"
+            Write-Host "Usage: multigravity auth <save|load|bind|unbind|status|clear> [profile] [args]"
         }
     }
 }
@@ -437,10 +864,12 @@ function Write-Usage {
     Write-Host "  template save <profile> <name>   Save a profile as a reusable template"
     Write-Host "  template list               List saved templates"
     Write-Host "  template delete <name>      Remove a template"
-    Write-Host "  auth save <name>            Save current active session to profile vault"
+    Write-Host "  auth save <name> [--force]  Save current active session to profile vault (guarded)"
+    Write-Host "  auth bind <name> <email>    Bind profile to an authoritative designated account"
+    Write-Host "  auth unbind <name>          Remove designated account binding for a profile"
     Write-Host "  auth load <name>            Load profile vault into active system session"
-    Write-Host "  auth status                 Show saved authentication accounts for all profiles"
-    Write-Host "  auth clear <name>           Clear saved session for a profile"
+    Write-Host "  auth status                 Show designated accounts and saved sessions for all profiles"
+    Write-Host "  auth clear <name> [--unbind] Clear saved session for a profile"
     Write-Host "  export <name> [path]        Archive a profile to a .zip file"
     Write-Host "  import <archive> [name]     Restore a profile from a .zip archive"
     Write-Host "  update                      Update multigravity to the latest version"
@@ -1193,7 +1622,10 @@ switch ($cmd) {
         Invoke-ProfileStats
     }
     "auth" {
-        Invoke-AuthCmd $arg1 $arg2
+        $extra = @()
+        if ($arg2)        { $extra += $arg2 }
+        if ($ForwardArgs) { $extra += $ForwardArgs }
+        Invoke-AuthCmd $arg1 $extra
     }
     "completion" {
         if ($arg1) {
