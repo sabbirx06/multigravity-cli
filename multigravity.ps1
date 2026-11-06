@@ -251,12 +251,24 @@ function Save-ProfileVault {
         } else {
             Write-Host "  [auth] Saved session for profile '$profileName'" -ForegroundColor Green
         }
+        $cliDir = "$profileDir\.gemini\antigravity-cli"
+        if (Test-Path $cliDir) {
+            Set-Content -Path "$cliDir\jetski-standalone-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
+            Set-Content -Path "$cliDir\antigravity-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
+        }
     } else {
         if (Test-Path "$profileDir\.auth_vault") {
             Remove-Item "$profileDir\.auth_vault" -Force -ErrorAction SilentlyContinue
         }
         if (Test-Path "$profileDir\.account") {
             Remove-Item "$profileDir\.account" -Force -ErrorAction SilentlyContinue
+        }
+        $cliDir = "$profileDir\.gemini\antigravity-cli"
+        if (Test-Path "$cliDir\jetski-standalone-oauth-token") {
+            Remove-Item "$cliDir\jetski-standalone-oauth-token" -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path "$cliDir\antigravity-oauth-token") {
+            Remove-Item "$cliDir\antigravity-oauth-token" -Force -ErrorAction SilentlyContinue
         }
         Write-Host "  [auth] Session cleared for profile '$profileName'" -ForegroundColor DarkYellow
     }
@@ -320,6 +332,11 @@ function Invoke-AuthCmd {
                 Write-Host "Saved active authentication session to profile '$name' ($email)" -ForegroundColor Green
             } else {
                 Write-Host "Saved active authentication session to profile '$name'" -ForegroundColor Green
+            }
+            $cliDir = "$profileDir\.gemini\antigravity-cli"
+            if (Test-Path $cliDir) {
+                Set-Content -Path "$cliDir\jetski-standalone-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
+                Set-Content -Path "$cliDir\antigravity-oauth-token" -Value $current -NoNewline -Encoding UTF8 -Force
             }
         }
         "load" {
@@ -394,6 +411,9 @@ function Invoke-AuthCmd {
             $profileDir = "$BASE\$name"
             if (Test-Path "$profileDir\.auth_vault") { Remove-Item "$profileDir\.auth_vault" -Force }
             if (Test-Path "$profileDir\.account") { Remove-Item "$profileDir\.account" -Force }
+            $cliDir = "$profileDir\.gemini\antigravity-cli"
+            if (Test-Path "$cliDir\jetski-standalone-oauth-token") { Remove-Item "$cliDir\jetski-standalone-oauth-token" -Force -ErrorAction SilentlyContinue }
+            if (Test-Path "$cliDir\antigravity-oauth-token") { Remove-Item "$cliDir\antigravity-oauth-token" -Force -ErrorAction SilentlyContinue }
             Write-Host "Cleared saved session for profile '$name'"
         }
         default {
